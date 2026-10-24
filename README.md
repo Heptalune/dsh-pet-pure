@@ -1,4 +1,4 @@
-# dsh-pet-pure · 鲸鱼娘纯桌宠
+# dsh-pet-pure · 鲸鱼娘纯粹桌宠
 
 <p align="center">
   <img alt="平台" src="https://img.shields.io/badge/平台-Windows-8A2BE2">
