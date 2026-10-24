@@ -109,7 +109,7 @@ powershell -ExecutionPolicy Bypass -File scripts\build_pure.ps1
 - **[PC2005-cloud](https://github.com/PC2005-cloud)** — [dsh-pet](https://github.com/PC2005-cloud/dsh-pet)：
   鲸鱼娘桌宠的创造者，全部动画素材与交互设计的来源
 - **[MerZlin](https://github.com/MerZlin)** — [dsh-pet-indesktop](https://github.com/MerZlin/dsh-pet-indesktop)：
-  把浏览器插件做成独立桌面应用（Python + PySide6），本 Fork 的直接上游
+  把DSH插件做成独立桌面应用（Python + PySide6），本 Fork 的直接上游
 
 ## 许可证
 
