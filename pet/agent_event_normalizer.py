@@ -1,0 +1,138 @@
+"""Compatibility normalizer from AgentEvent facts to Pet semantic events."""
+from __future__ import annotations
+from dataclasses import dataclass, field
+from typing import Any
+from .agent_event_protocol import AgentEvent, parse_agent_event
+
+@dataclass(frozen=True)
+class SemanticEvent:
+    source: str
+    agent_name: str
+    session_id: str
+    step: int | str | None = None
+    data: dict[str, Any] = field(default_factory=dict)
+    # 上游事件名（归一化后的规范名）。语义事件的消费端按它判定事件语义：
+    # ModelAccessTracker 用它识别 llm/retry 的限流计数与复位时机。原始写法仍保留在
+    # AgentEvent.event（协议层）上，这里给的是语义层统一后的规范名。
+    event: str = ""
+
+@dataclass(frozen=True)
+class LifecycleEvent(SemanticEvent): pass
+@dataclass(frozen=True)
+class ToolCallEvent(SemanticEvent):
+    tool: str = ""
+    target: str = ""
+    action_class: str = ""
+@dataclass(frozen=True)
+class ToolResultEvent(SemanticEvent):
+    tool: str = ""
+    ok: bool = True
+    target: str = ""
+@dataclass(frozen=True)
+class ReasoningEvent(SemanticEvent):
+    summary: str = ""
+    delta: bool = False
+@dataclass(frozen=True)
+class EvidenceEvent(SemanticEvent):
+    tool: str = ""
+    target: str = ""
+    status: str = ""
+@dataclass(frozen=True)
+class ActionEvent(ToolCallEvent): pass
+@dataclass(frozen=True)
+class RetryEvent(SemanticEvent):
+    code: str = ""
+    message: str = ""
+    retry: int | str | None = None
+@dataclass(frozen=True)
+class ErrorEvent(SemanticEvent):
+    code: str = ""
+    message: str = ""
+@dataclass(frozen=True)
+class ApprovalEvent(SemanticEvent): status: str = ""
+@dataclass(frozen=True)
+class QuestionEvent(SemanticEvent): status: str = ""
+@dataclass(frozen=True)
+class UserActionEvent(SemanticEvent): action: str = ""
+@dataclass(frozen=True)
+class InteractionResolvedEvent(SemanticEvent):
+    kind: str = ""
+    request_id: str = ""
+    rpc_id: str = ""
+    approval_id: str = ""
+    call_id: str = ""
+    outcome: str = ""
+
+_LIFECYCLE = {"agent/status", "AgentStatus", "session/created", "session/disposed", "turn/start", "turn/end", "step/start", "step/end", "task_started", "task_complete", "thread_rolled_back"}
+_EXPLORATION = {"read", "grep", "glob", "search", "web_search", "web_search_begin", "exec_command_begin"}
+_ACTION = {"edit", "write", "patch", "shell", "pwsh", "bash", "pytest", "npm test", "playwright", "run"}
+
+# 上游可能用非语义名书写同一事件：DSH 状态记录写 "AgentStatus"，而消费端复位词表
+# （model_access_tracker._resets）按 "agent/status" 判定。归一化点负责统一成规范名，
+# 使产物字段 event 与消费端词表严格一致（原始写法仍留在协议层 AgentEvent.event）。
+_EVENT_ALIASES = {"agentstatus": "agent/status"}
+
+def _data(ev: AgentEvent) -> dict[str, Any]:
+    return ev.data
+
+def _resolved_ids(ev: AgentEvent, data: dict[str, Any]) -> dict[str, str]:
+    """收尾事件的配对身份：**顶层身份字段优先回退到信封**。
+
+    ``AgentEvent.from_record`` 把顶层 callId/requestId 移出 data、存进信封
+    (``ev.call_id`` / ``ev.request_id``)，而桥接的收尾帧（writeInteractionResolved
+    与 resolveQuestion）正是把身份写在顶层的——只读 ``data.get("callId")`` 会恒得
+    空串，callId 配对的收尾在语义层永远配不上（``_on_normalized_event`` 按身份
+    字符串相等关闭交互）。
+    """
+    return {
+        "request_id": str(data.get("requestId") or ev.request_id or ""),
+        "rpc_id": str(data.get("rpcId") or ""),
+        "approval_id": str(data.get("approvalId") or ""),
+        "call_id": str(data.get("callId") or ev.call_id or ""),
+    }
+
+def normalize_event(record: AgentEvent | dict, *, source_hint: str = "", agent_name_hint: str = "") -> SemanticEvent | None:
+    ev = record if isinstance(record, AgentEvent) else parse_agent_event(record, source_hint=source_hint, agent_name_hint=agent_name_hint)
+    data = _data(ev)
+    typ = ev.event
+    lower = typ.lower()
+    common = dict(source=ev.source, agent_name=ev.agent_name, session_id=ev.session_id, step=ev.step, data=data,
+                  event=_EVENT_ALIASES.get(lower, lower))
+    if typ in _LIFECYCLE or lower in _LIFECYCLE:
+        return LifecycleEvent(**common)
+    if lower in {"assistant/message", "assistant/chunk", "agent_reasoning", "agent_reasoning_raw_content", "reasoning"}:
+        return ReasoningEvent(**common, summary=str(data.get("summary") or data.get("text") or data.get("content") or "")[:300], delta=lower.endswith("chunk") or "delta" in data)
+    if lower in {"tool/call", "command/run", "tool-workflow/run-start", "exec_command_begin", "mcp_tool_call_begin"}:
+        tool = str(data.get("tool") or data.get("toolName") or data.get("name") or "")
+        target = str(data.get("target") or data.get("filePath") or data.get("path") or data.get("query") or "")[:300]
+        cls = "ACTION" if tool.lower() in _ACTION or lower == "command/run" else "EXPLORATION" if tool.lower() in _EXPLORATION or lower in _EXPLORATION else "OTHER"
+        typ_cls = ActionEvent if cls == "ACTION" else ToolCallEvent
+        return typ_cls(**common, tool=tool, target=target, action_class=cls)
+    if lower in {"tool/result", "exec_command_end", "mcp_tool_call_end"}:
+        ok = data.get("ok", True) not in (False, 0, "false", "error")
+        result = ToolResultEvent(**common, tool=str(data.get("tool") or data.get("toolName") or ""), ok=ok, target=str(data.get("target") or data.get("path") or "")[:300])
+        return result if not ok else EvidenceEvent(**common, tool=result.tool, target=result.target, status=str(data.get("evidenceStatus") or "new"))
+    if lower == "llm/retry":
+        failure = data.get("failure") if isinstance(data.get("failure"), dict) else data
+        return RetryEvent(**common, code=str(failure.get("code") or data.get("errorCode") or ""), message=str(failure.get("message") or data.get("errorMessage") or "")[:300], retry=data.get("retry"))
+    if lower in {"agent/request-error", "execution/failed", "llm_error", "error"}:
+        return ErrorEvent(**common, code=str(data.get("errorCode") or data.get("code") or ""), message=str(data.get("errorMessage") or "")[:300])
+    # 具体收尾判定必须排在 approval/* 、question/* 前缀匹配**之前**：
+    # approval/decided、approval/resolved、question/resolved 是收尾帧，被前缀
+    # 分支吃掉（ApprovalEvent/QuestionEvent(status=...)）会让语义层的交互收尾
+    # （``_on_normalized_event`` 按身份配对关闭）对这三种旧名全程失效。
+    if lower in {"approval/decided", "approval/resolved", "question/resolved"}:
+        kind = "question" if lower == "question/resolved" else "approval"
+        outcome = str(data.get("outcome") or data.get("decision") or ("answered" if kind == "question" else "approved"))
+        return InteractionResolvedEvent(**common, kind=kind, **_resolved_ids(ev, data), outcome=outcome)
+    if lower == "interaction/resolved":
+        return InteractionResolvedEvent(**common, kind=str(data.get("kind") or ""), **_resolved_ids(ev, data), outcome=str(data.get("outcome") or ""))
+    if lower.startswith("approval/"): return ApprovalEvent(**common, status=lower.split("/", 1)[1])
+    if lower.startswith("question/"): return QuestionEvent(**common, status=lower.split("/", 1)[1])
+    if lower == "user_action":
+        action = str(data.get("action") or "")
+        if "resolved" in action or "decided" in action:
+            kind = "question" if "question" in action else "approval"
+            return InteractionResolvedEvent(**common, kind=kind, **_resolved_ids(ev, data), outcome=str(data.get("outcome") or data.get("decision") or ""))
+        return UserActionEvent(**common, action=action)
+    return None

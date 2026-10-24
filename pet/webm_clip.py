@@ -1,0 +1,3051 @@
+# -*- coding: utf-8 -*-
+"""
+WebM-backed clip library（webm 主路线）。
+
+使用 imageio-ffmpeg 自带的静态 ffmpeg 解码 640×360 透明 webm：
+- read_frames(..., pix_fmt='rgba', bits_per_pixel=32, input_params=_FFMPEG_INPUT_PARAMS)
+  可正确保留 VP9 alpha，输出 RGBA 原始帧。
+- imageio_ffmpeg 内部在 Windows 上使用 STARTUPINFO 隐藏控制台窗口，
+  避免旧 ffmpeg 子进程方案导致的“窗口反复出现/消失”。
+
+线程模型（B7 生命周期受控）：
+- 后台 reader 线程只负责把 RGBA 字节放入有界队列；每帧附带素材源时间线
+  帧号（0-based），队列满丢弃时源帧号照常推进（被丢弃的帧仍占用时间线
+  槽位）——主线程拿到的显示帧索引在丢帧后依然锚定素材原始时间线；
+- 主线程 QTimer 按视频 fps 从队列取帧，构造 QImage/QPixmap 并发出
+  frameChanged(源时间线帧号)；
+- 帧号契约（P1 复审）：frameChanged / currentFrameNumber 携带 0-based
+  素材源时间线帧号（显示帧索引，= elapsed video time × fps）；播放计数
+  _frame_index 是 1-based 主线程已消费帧数。降帧相位与末帧判断必须用
+  显示帧索引，绝不能使用消费计数（队列满丢帧后两者不再相等）；
+- 解码节流（批11，闲置降帧联动）：set_decode_throttle(ratio) 把消费端
+  QTimer interval ×ratio，同时 reader 入队由「超时丢帧」切为「有界阻塞
+  重试」——队列写满后 ffmpeg 的 stdout 管道写满、解码进程阻塞在 write()，
+  解码速率随消费端联动下降到 ≈原始 fps/ratio。非闲置（ratio=1）路径
+  与历史行为逐位一致（超时丢帧 + 全速解码）；
+- 进程内循环（批8）：帧数精确已知（count_frames_and_secs 或其缓存）时，
+  主播放 reader 以 -stream_loop -1 -readrate max(1, playback_speed) 常驻，
+  单个进程持续出帧，消灭「每圈动画重启一个 ffmpeg 进程」的 churn；
+  帧数未知/估算则退化为播一遍自然结束（现状路径）。reader 把解码序号
+  按 frame_count 取模回绕成源时间线帧号（0..N-1 循环），每圈边界仍向上
+  交付一次结束标记（None → finished），上层动画链调度零改动；圈末自然
+  结束的 stop() 转为「软停驻留」（保留进程等续圈，宽限期满未续圈则
+  reader 自行退出杀进程），续播同一 clip 经 start() re-arm 直接续圈
+  （带唤醒握手，握手失败落回 fresh start）；中途打断/切换/关停仍走
+  硬停杀进程（原路径不变）；
+- 圈边界定期回收（批11-B1）：长寿 ffmpeg 进程在圈边界驻留时按存活时长
+  定期重建（ffmpeg_recycle_minutes，默认 10min，0=关闭）。到阈值的圈末
+  不做 park/re-arm、reader 正常退出杀进程，下一次 start() 自然 fresh
+  spawn——把 ffmpeg 进程内部（分配器高水位/解复用器随 -stream_loop 回绕
+  累积）47→64MB 的爬升周期性清零。回收只在圈边界动手，绝不播放中途杀
+  进程；圈边界是完美切口（-stream_loop 每圈本就从帧 0 重启，视觉无感）。
+- 所有 Qt GUI 操作只发生在主线程。
+- 同一 clip 最多 1 个 active reader + 有上限的退役 reader（_MAX_RETIRED_READERS）：
+  stop() 主动 terminate 底层 ffmpeg 进程（_PopenCapture 捕获句柄），退役池超上限时
+  强制回收最旧的；start() 前零等待清空退役池，存活 reader 累积超限仅日志告警，绝不拒绝启动。
+- cleanup() 对仍存活的退役 reader 保留追踪（绝不静默丢弃），等待后续 sweep 回收。
+- Popen 并发串行化（批 6-8b，Windows access violation 主凶修复）：clip 名下任一
+  Popen 的「操作」（poll/terminate/wait/kill/关管道）任意时刻只允许一个线程执行。
+  播放 reader 的 Popen 由 reader 线程独占生命周期（创建/读/close/terminate/wait/
+  kill），GUI stop() 只置 stop_evt + 经 _unblock_proc 做最小 TerminateProcess 解除
+  阻塞读（所有权仍在 reader，GUI 绝不 wait/kill/关管道）；首帧解码进程同样由解码
+  线程独占 close/terminate，GUI cancel_first_frame_warm 的完整 terminate 与之经
+  _ff_proc_lock 互斥。阻塞读（generator 内 stdout.read）不持锁——只与最小
+  terminate 并发（进程句柄 vs 管道句柄，不同原生对象），是解除阻塞读的既定安全
+  配对。详见 _proc_lock/_ff_proc_lock 的注释。
+- try-acquire 超时跳过的最终保障链（批 6-8b 收尾；R3 闭合 R2 复审 P1）：
+  _unblock_proc / cancel_first_frame_warm 的锁超时跳过依赖 owner
+  （reader/decode 线程）在 finally 杀进程——这是条件保证；闭合它的兜底是
+  ——reader 的（thread, proc）随 stop() 进入退役池，孤儿注册表 sweep 的
+  _reap_retired 在线程退出（finally 完成）后经 _confirm_retired_proc 补杀
+  仍存活者；首帧进程在取消超时跳过时登记进 _unconfirmed_procs，sweep 的
+  _sweep_unconfirmed_procs 在 owner 释放 _ff_proc_lock 后确认/补杀。
+  两条兜底链对「poll 异常 / terminate+kill 后仍存活」都不静默丢句柄：
+  确认失败保留追踪并累计有界重试，达到上限（_CONFIRM_KILL_MAX /
+  _UNCONFIRMED_KILL_MAX）告警；首帧条目标注 abandoned 后在其后的 sweep 做
+  终局处置（记审计日志后清出追踪，不再钉住 clip）——绝不漏杀、不无限静默
+  重试、不刷屏，也不静默丢句柄。sweep 的补杀（poll/terminate）
+  在注册表锁外执行（锁内只取快照，写回再进锁），单个 clip 的串行补杀不阻塞
+  其他 clip 的 register/unregister。
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import queue
+import subprocess
+import sys
+import threading
+import weakref
+import time
+import types
+import json
+import tempfile
+from collections import OrderedDict
+from pathlib import Path
+
+from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal, Slot
+from PySide6.QtGui import QImage, QPixmap
+from PySide6.QtWidgets import QApplication
+
+from . import catalog
+from . import mem_debug
+from . import perfstats
+from . import win_job
+from .frame_cache import ByteBudgetLru
+
+logger = logging.getLogger(__name__)
+
+# 进程内元数据缓存：避免反复切换角色时重复调用 count_frames_and_secs
+# （P2 审计 2026-09：key=(path|mtime|size) 随素材原地更新单调新增且永不
+# 逐出——无界；改字节预算 + LRU，复用 frame_cache 的预算模式。默认
+# 512KB ≈ 数千条（多角色 × 文件版本）量级，超出逐出最久未用：旧版本
+# 失效条目最先走，仍在用的版本常驻；逐出后经磁盘缓存命中可零 ffmpeg 重探）。
+_META_CACHE_MAX_BYTES = 512 * 1024
+_META_CACHE = ByteBudgetLru(_META_CACHE_MAX_BYTES)
+
+# 跨进程共享的元数据缓存文件：多开实例共享同一份，避免每个实例都拉起
+# ffmpeg 探测 91 段动画。缓存以（文件 mtime + size）为失效依据。
+# 条目数硬上限（P2 审计）：该文件跨进程/跨运行单调累积且从不清理——
+# 每轮素材更新新增整套 key 后永久留存，长期无界；写路径在合并后按
+# 「先写入先逐出」裁到上限（无访问时间戳，近似 LRU，仅防病态长尾），
+# 20000 条 ≈ 3MB 文件，正常使用（多角色 × 版本数）远够不到。
+_META_FILE_CACHE_PATH = Path(tempfile.gettempdir()) / "dsh-pet-media-meta-cache.json"
+_META_FILE_CACHE_MAX_ENTRIES = 20000
+_META_FILE_CACHE: dict | None = None
+# 加载边界体检出的死条目 key（源文件已不存在）：本进程后续落盘时顺手把这些条目
+# 从磁盘文件里一并带走——一次全表体检的结论跨写复用，不必每写一条重扫全表。
+_META_FILE_CACHE_DEAD: set[str] = set()
+_META_CACHE_LOCK = threading.Lock()
+
+# ------------------------------------------------------------ reader 生命周期（B7）
+# 同一 clip 允许的退役 reader 上限：1 个 active reader + 1 个 retiring reader。
+_MAX_RETIRED_READERS = 1
+# 强制回收最旧退役 reader 时的有界 join 时长（秒）；真实 reader 的 ffmpeg 已被
+# terminate，join 通常在毫秒级返回，此值只作为病态场景（卡死）的上限。
+_RECLAIM_JOIN_TIMEOUT = 0.5
+# cleanup（终结路径）在首次有界 reap 后仍剩存活退役 reader 时的额外总宽限
+# （秒，10ms 步进轮询）：reap 的 0.5s join 在极慢/满载 CI 上偶发不足——reader
+# 的 ffmpeg 已被 terminate、只差线程自身收尾调度，常几十 ms 内退出；这里只给
+# 终结点一个短窗口吸收尾差，仍存活者再交给模块级孤儿注册表持续回收。
+# 只在 cleanup() 生效，stop()/sweep 等热路径不动（GUI 阻塞纪律不变）。
+_CLEANUP_RETIRE_GRACE_S = 2.0
+# 定时 sweep（孤儿注册表 → _reap_retired 消费）对仍存活退役
+# reader 的 join 时长（秒）。退役 reader 本就 ≤1s 自灭，
+# join 只是加速确认，不该让 GUI 每趟最多垫 0.2s×N（圈末 churn 批量慢死 reader
+# 时 2-3×0.2s ≈ 400-600ms，正是 444-499ms 卡顿簇候选主因之一，F3 下调到 0.05）。
+_SWEEP_JOIN_TIMEOUT = 0.05
+# terminate 后等待进程退出的有界时长（秒）；超时则 kill 强杀（P2）。
+# 在 GUI 线程调用时（stop/_reap_retired）该值同时是 GUI 阻塞上限，
+# 正常进程 terminate 后毫秒级退出，此值只作为病态场景的兜底。
+_PROC_TERMINATE_TIMEOUT = 0.5
+# 结束标记（None）放入队列的总时限（秒，Fix C）：正常路径队列很快腾出
+# 槽位、立即送达；仅病态（队列持续满且无人消费、stop_evt 缺失的历史僵尸）
+# 时有界放弃并告警，绝不让 reader 永久空转。放弃后 finally 仍保证
+# _terminate_proc 与 gen.close() 执行。
+_END_MARKER_PUT_TIMEOUT = 5.0
+# GUI 侧「最小解除阻塞 terminate」（_unblock_proc）获取 _proc_lock /
+# _ff_proc_lock 的有限等待（秒，批 6-8b）：超过此时长说明 reader/解码线程
+# 正在 finally 收尾（持锁），它自己会 terminate 进程——GUI 跳过是安全的
+# （绝不漏杀），同时也绝不让 stop()/cancel_first_frame_warm() 因锁等待
+# 明显变长（用户可感知的响应延迟红线）。
+_PROC_LOCK_ACQUIRE_TIMEOUT = 0.2
+# 首帧进程「取消后未确认退出」的有界补杀重试上限（批 6-8b 收尾；R3 语义）：
+# cancel_first_frame_warm 的 try-acquire 超时跳过、或 terminate 未能确认退出
+# 的进程登记进 _unconfirmed_procs，孤儿注册表 sweep 周期补杀；owner（解码
+# 线程）持续持锁不释放（g.close() 病态卡死）或补杀后进程仍存活（poll 异常 /
+# kill 失败）时，达到此上限记录告警并**标注 abandoned**，其后一轮 sweep 终局
+# 处置（记审计日志后清出追踪，不再钉住 clip）——不无限静默重试、不刷屏，也
+# 不静默丢句柄（与 _LEAK_ATTEMPTS 的「不无限静默重试」同一原则）。
+_UNCONFIRMED_KILL_MAX = 6
+# 退役 reader 兜底确认（_confirm_retired_proc）失败后的有界重试上限
+# （批 6-8b R3）：线程退出后 poll 异常 / terminate+kill 后仍存活时保留
+# _Reader 记录并累计重试；达到此上限记录告警并标注 abandoned（保留追踪
+# 不再重试）——绝不静默丢弃句柄（与 _UNCONFIRMED_KILL_MAX 同一原则）。
+_CONFIRM_KILL_MAX = 6
+
+# 圈边界续圈宽限（秒，批8）：reader 在每圈末尾交付结束标记后驻留等续圈
+# （上层 finished → 调度 → start() re-arm 都在同一 GUI 事件序列内完成，
+# 正常只有毫秒级），宽限期满仍未续圈 = 已切走/被打断/无人消费——reader
+# 自行退出并由 finally 杀掉 ffmpeg，切走的旧 clip 绝不泄漏常驻进程。
+# 取值只须覆盖同 tick 的调度窗口：1s 已足够保守；更大会拖长被遗弃 clip
+# 的进程驻留（跨测试/切动画后的线程残留会放大登记册 flake 家族的误判）。
+_LOOP_REARM_GRACE_SECS = 1.0
+
+# re-arm 唤醒握手超时（秒，批8 P1-2）：re-arm 置位 gate 后等 reader 在
+# _loop_lock 内置 ack；超时 = reader 实际已在退出（is_alive 的 finally
+# 窗口），回滚并落回 fresh start——绝不让 start() 返回 True 却无 reader
+# 存活（动画链停摆）。正常路径 ack 毫秒级到达，正常预算毫秒级，0.5s 是病态
+# 预算；GUI 满等 0.5s 也是圈末卡顿簇候选主因之一（F3 下调到 0.15——回滚路径
+# fresh start 本就安全）。
+_LOOP_REARM_ACK_TIMEOUT = 0.15
+
+# 订阅授权有界等待预算（毫秒，批5.3）：进程内 fan-out 的 feed 立即就绪，
+# 实际不等待；常量本地化以替代对 decode_broker 的 import（该模块退役后
+# webm_clip 不再反向依赖 broker）。
+_SUBSCRIBE_BUDGET_MS = 600
+
+# ------------------------------------------------------------ ffmpeg exe 探测串行化（批 6-8b）
+# imageio 的 get_ffmpeg_exe() 在缓存未命中时用 subprocess.check_call 跑
+# `ffmpeg -version` 探测（**无限等待**）。并发 reader 同时冷启动会各自拉起
+# 探测进程：进程拉起风暴显著拖慢探测，极端负载下探测可超过 0.5s——快速
+# start/stop 时被 stop 的 reader 会滞留在探测里迟迟不退（test_webm_clip_
+# lifecycle::test_rapid_start_stop 的既有 flake 根因，基线 2/30 失败）。
+# 用模块级锁串行化首次探测：一次命中缓存后所有后续调用零进程开销。reader
+# 在拉起解码进程前探测、且探测后复查 stop_evt——被 stop 的 reader 绝不
+# 拉起解码进程（省掉「拉起→_register 发现 stale→自终止」的浪费与延迟）。
+_FFMPEG_EXE_LOCK = threading.Lock()
+
+# ffmpeg 解码启动参数（主播放 reader 与首帧解码共享的基础集）：
+# 640×360 VP9 单帧解码量极小，多线程只是白付线程池内存。实测（同二进制
+# 同素材）：默认 66MB → -threads 1 为 53MB（每实例解码子进程 -13MB）。
+# codec 路径不变，语义零差异。
+# 批8：-stream_loop/-readrate 不在这个共享集里——它们只属于主播放
+# reader，且仅当帧数精确已知（count_frames_and_secs 或其缓存）时由
+# _reader_local 按 clip 追加（帧数未知/估算则退化为播一遍自然结束，
+# 现状路径）；首帧解码只读一帧即关，绝不带循环参数。
+_FFMPEG_INPUT_PARAMS = [
+    '-c:v', 'libvpx-vp9',
+    '-threads', '1',
+]
+
+# ------------------------------------------------------------ 会话结束（关机/注销）spawn 闸门（issue #111）
+# 现象：Windows 关机/注销时必弹「ffmpeg-*.exe - 应用程序无法正常启动
+# (0xc0000142)」并阻塞关机流程。
+#
+# 机制：0xc0000142 = STATUS_DLL_INIT_FAILED。关机时系统先发
+# WM_QUERYENDSESSION，随后开始拆除本次登录会话（窗口站、桌面堆、CSRSS 等）。
+# 若本进程在这之后仍 CreateProcess 新的 ffmpeg，进程虽然创建成功，其
+# user32/gdi32 却初始化失败——系统于是弹出错误对话框。桌宠的 ffmpeg 启停
+# 极其频繁（冷首帧预热 / reader 换代 / 元数据探测 / 圈末回收后 fresh spawn），
+# 撞上关机窗口的概率因此几乎为 100%。
+#
+# 闸门语义：一旦收到会话结束通知就**永久**置位（进程正在退出，不需要复位），
+# 之后所有 ffmpeg spawn 路径一律拒绝。调用方契约零改动——被拒的路径都已有
+# 既有降级：start() 返回 False（窗口层回退上一动画/待机，见
+# tests/test_switch_start_failure_window.py），首帧解码返回 None（走缓存帧），
+# 元数据探测保留默认值（后续按需再取）。
+#
+# 权威置位点：pet/session_watcher.py（Windows 原生 WM_QUERYENDSESSION /
+# WM_ENDSESSION 过滤器 + Qt 会话信号兜底）。进程级 bool，跨线程读写安全
+# （读者只判真假，无复合不变量），无需加锁——本闸门在热路径上被每帧读取。
+_SESSION_ENDING = False
+
+
+def session_ending() -> bool:
+    """会话是否已结束（Windows 关机/注销已开始）。置位后绝不再 spawn ffmpeg。"""
+    return _SESSION_ENDING
+
+
+def set_session_ending(armed: bool = True) -> None:
+    """置位/复位会话结束闸门（幂等；产品代码只置位，复位仅供测试收口）。"""
+    global _SESSION_ENDING
+    if _SESSION_ENDING == bool(armed):
+        return
+    _SESSION_ENDING = bool(armed)
+    logger.info(
+        '会话结束闸门%s：此后不再派生 ffmpeg 子进程（issue #111）',
+        '已置位' if _SESSION_ENDING else '已复位',
+    )
+
+
+def _reset_session_ending_for_tests() -> None:
+    """仅测试用：复位进程级闸门（否则会串到后续用例，静默不起 reader）。"""
+    global _SESSION_ENDING
+    _SESSION_ENDING = False
+
+
+def _ensure_ffmpeg_exe() -> None:
+    """串行化首次 ffmpeg exe 探测并预热缓存（幂等，任意线程可调用）。
+
+    imageio_ffmpeg 不可用 / 探测失败时为无操作（read_frames 内部会再报错）。
+    锁内探测保证并发调用方不重复拉起探测进程；探测完成后 lru_cache 命中，
+    后续 get_ffmpeg_exe() 零子进程开销。
+
+    会话结束（Windows 关机/注销）时直接放弃探测：`get_ffmpeg_exe()` 冷缓存下
+    会跑 `ffmpeg -version`，同样是一次 spawn（参见 _SESSION_ENDING 说明）。
+    """
+    if imageio_ffmpeg is None:
+        return
+    if session_ending():
+        return
+    with _FFMPEG_EXE_LOCK:
+        try:
+            imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception:
+            pass
+
+# ------------------------------------------------------------ 孤儿 sweep 生命周期管理器（B7 审查 P2）
+# 退役 reader 的回收由「独立生命周期管理器」持有：注册表记录所有
+# 退役池非空的 clip，lazy QTimer 周期回收。状态与回收逻辑收编进
+# `_OrphanClipRegistry`（N2b），模块级 `_register_orphan` /
+# `_unregister_orphan` 只是委托到模块底部单例
+# `_ORPHAN_REGISTRY` 的薄壳，clip 侧调用点与时序零改动。
+#
+# 为什么必须模块级单例持有：若 sweep timer 是 clip 的成员 QTimer，会形成
+# 引用环（clip → timer → 连接 → clip），循环 GC 可能在 reader 线程仍在
+# 收尾（finally/gen.close/进程 teardown）时回收整个 clip——clip 的属性
+# （锁/队列/进程句柄）在 reader 线程使用中被释放，Windows 上原生崩溃。
+# 模块级注册表强引用持有 clip，直到其退役池清空，杜绝该竞态；同时满足
+# 「cleanup 后不残留调度」（cleanup 后 clip 自身不再安排任何 timer，
+# 由管理器统一回收）与「cleanup 不丢追踪」（存活 reader 的记录被持有
+# 到线程退出）。
+class _OrphanClipRegistry:
+    """跨实例孤儿回收管理器：退役 reader 的注册表 + lazy sweep timer（N2b）。
+
+    线程归属：
+    - 注册表（_clips）由 _lock 保护：register/unregister/holders 任意
+      线程可调用（clip 的 cleanup/stop 在主线程，reader 线程不触碰）；
+    - sweep QTimer 只能在 GUI 线程创建（须已有 QApplication）与启动；
+      reap 由 Qt 事件循环在 GUI 线程触发。R3（R2 复审「锁内串行补杀的
+      累计阻塞」闭合）：reap 不再全程持 _lock——锁内只取快照（list 强引用
+      持有 clip，锁外窗口内不被 GC），锁外对每个 clip 做有界 join 与补杀
+      （_reap_retired 的 join 时长受模块级 _SWEEP_JOIN_TIMEOUT 兜底、
+      _sweep_unconfirmed_procs 的锁等待受 _PROC_LOCK_ACQUIRE_TIMEOUT
+      兜底，正常毫秒级），状态写回（移出注册表 / 泄漏计数 / _ensure_timer）
+      时再进锁；_reaping 标志防止锁外窗口期重复 reap 交错。此期间
+      register/unregister 只会在「取快照 / 写回」两个短临界区短暂阻塞，
+      不会被单个 clip 的串行补杀长时间阻塞。
+
+    生命周期语义（与既有模块级实现逐条一致，只搬形态不改时序/加锁）：
+    - register：强引用持有 clip（防 GC 与 reader 收尾竞态），并启动 timer；
+    - reap：快照后对注册的 clip 做有界回收与首帧补杀，退役池清空且无
+      未确认首帧进程者移出注册表；仍存活者累计回收次数，达到
+      _LEAK_ATTEMPTS 阈值首次记录泄漏告警（只打一条，不无限静默重试也不刷屏）
+      并继续持有追踪；
+    - unregister：移除追踪（退役池已清空时调用）。
+    """
+
+    _SWEEP_DELAY_MS = 500  # 惰性 sweep timer 的间隔（原 _ORPHAN_SWEEP_DELAY_MS）
+    _LEAK_ATTEMPTS = 6  # 病态 reader 永不退出时的泄漏告警阈值（原 _ORPHAN_LEAK_ATTEMPTS）
+
+    class _ArmInvoker(QObject):
+        """跨线程编排信号载体（终审 P1-4）：worker 线程的 register 经
+        arm_requested 信号排队到 GUI 线程执行 timer 创建/启动。实例在注册表
+        实例化（模块导入 = 主线程 = 本应用的 GUI 线程）时创建，affinity 即
+        主线程；在任意线程 emit 都安全（Qt 排队投递）。
+
+        槽必须挂在 QObject（本类自身）上：排队投递到 QObject receiver 是
+        Qt 久经验证的跨线程路径（与 PetWindow.fullscreen_changed 同款）；
+        投递到非 QObject 的 plain callable 在跨线程场景不稳定（终审修复
+        初版曾因此原生崩溃）。"""
+
+        arm_requested = Signal()
+
+        def __init__(self, registry: "_OrphanClipRegistry") -> None:
+            super().__init__()
+            self._registry = registry
+            # AutoConnection：emit 线程 ≠ invoker 所在线程（主线程）时自动
+            # 走 QueuedConnection，槽在 GUI 线程执行。
+            self.arm_requested.connect(self._on_arm_requested)
+
+        @Slot()
+        def _on_arm_requested(self) -> None:
+            self._registry._arm_sweep_timer_on_gui()
+
+    def __init__(self) -> None:
+        self._clips: "set[WebMClip]" = set()
+        self._lock = threading.Lock()
+        self._timer: "QTimer | None" = None
+        # reap 防重入（R3）：reap 的锁外窗口期（补杀 poll/terminate）不持
+        # _lock，第二个并发 reap 进入时直接跳过，避免与首个 reap 交错。
+        self._reaping = False
+        self._arm_invoker = self._ArmInvoker(self)
+
+    def register(self, clip: "WebMClip") -> None:
+        """把退役池非空的 clip 挂到注册表（强引用持有，防 GC 竞态）。
+
+        终审 P1-4：timer 的创建/启动必须在 GUI 线程——本方法可被任意线程
+        调用（如首帧进程收尾经 _track_unconfirmed_proc 在解码线程触发），
+        若在无线程事件循环的 worker 线程里首次创建并 start QTimer，sweep
+        永不触发（Qt 定时器只在其所属线程的事件循环里工作），退役 reader /
+        未确认首帧进程将无人回收。非 GUI 线程经 _ArmInvoker 信号排队到
+        GUI 线程执行（多次编排幂等）。
+        """
+        with self._lock:
+            self._clips.add(clip)
+        self._arm_sweep_timer()
+
+    def _arm_sweep_timer(self) -> None:
+        """确保 sweep timer 存在并启动（只在 GUI 线程执行创建/启动）。"""
+        app = QApplication.instance()
+        if app is None:
+            return
+        if QThread.currentThread() is app.thread():
+            self._arm_sweep_timer_on_gui()
+        else:
+            self._arm_invoker.arm_requested.emit()
+
+    def _arm_sweep_timer_on_gui(self) -> None:
+        """创建（若未建）并启动 sweep timer——只在 GUI 线程执行。"""
+        timer = self._ensure_timer()
+        if timer is not None:
+            timer.start()
+
+    def unregister(self, clip: "WebMClip") -> None:
+        with self._lock:
+            self._clips.discard(clip)
+
+    # 测试 seam：仅供测试注入，产品侧无调用
+    def holders(self) -> "set[WebMClip]":
+        """当前被持有追踪的 clip 快照（加锁拷贝；诊断/测试用）。"""
+        with self._lock:
+            return set(self._clips)
+
+    def _ensure_timer(self) -> "QTimer | None":
+        """惰性创建 sweep timer（须在 GUI 线程；无 QApplication 时返回 None）。"""
+        if self._timer is None:
+            app = QApplication.instance()
+            if app is None:
+                return None
+            self._timer = QTimer()
+            self._timer.setSingleShot(True)
+            self._timer.setInterval(self._SWEEP_DELAY_MS)
+            self._timer.timeout.connect(self.reap)
+        return self._timer
+
+    def reap(self) -> None:
+        """对注册的 clip 做有界回收；退役池清空者移出注册表。
+
+        R3（R2 复审「sweep 锁内串行补杀的累计阻塞」闭合）：补杀的
+        poll/terminate（clip._reap_retired 的兜底确认与
+        clip._sweep_unconfirmed_procs 的补杀）**移出注册表锁**——锁内只取
+        快照（快照 list 强引用持有 clip，锁外窗口内不被 GC），锁外对每个
+        clip 做有界 join / 补杀确认（时长分别受 `_SWEEP_JOIN_TIMEOUT` /
+        `_PROC_LOCK_ACQUIRE_TIMEOUT` 兜底，正常毫秒级），状态写回（移出
+        注册表 / 泄漏计数 / `_ensure_timer()`）时再进锁。单个 clip 的串行
+        补杀不再阻塞其他 clip 的 register/unregister；`_reaping` 标志防止
+        锁外窗口期重复 reap 交错。病态 reader 多次回收仍不退出时记录泄漏
+        告警（而不是无限静默重试）。
+        """
+        with self._lock:
+            if self._reaping:
+                return  # 已有 reap 在锁外窗口期运行：本次跳过（下次 timer 再来）
+            self._reaping = True
+            holders = list(self._clips)
+        try:
+            for clip in holders:
+                try:
+                    clip._reap_retired(join_timeout=_SWEEP_JOIN_TIMEOUT)
+                except Exception:
+                    pass  # clip 已销毁等：交由 GC 兜底
+                try:
+                    clip._sweep_unconfirmed_procs()
+                except Exception:
+                    pass
+            with self._lock:
+                for clip in holders:
+                    if not clip._retired and not clip._has_unconfirmed_procs():
+                        self._clips.discard(clip)
+                if self._clips:
+                    for clip in self._clips:
+                        clip._orphan_reap_count = getattr(clip, '_orphan_reap_count', 0) + 1
+                        # 缺陷 21：告警只在首次越阈打一条。此前用 `>=` 判定，
+                        # 越阈后每一轮 sweep（间隔 500ms）都重复同一条 warning，
+                        # 日志被自己的回声淹没、真信号被稀释。
+                        if (clip._orphan_reap_count >= self._LEAK_ATTEMPTS
+                                and not getattr(clip, '_leak_warned', False)):
+                            clip._leak_warned = True
+                            logger.warning(
+                                'webm 退役 reader 多次回收仍存活（疑似泄漏，进程已 terminate）: %s',
+                                clip.path,
+                            )
+                    timer = self._ensure_timer()
+                    if timer is not None:
+                        timer.start()
+        finally:
+            with self._lock:
+                self._reaping = False
+
+
+# 模块级单例：跨实例孤儿回收管理器（强引用持有 clip，防 GC 竞态）。
+_ORPHAN_REGISTRY = _OrphanClipRegistry()
+
+
+def _register_orphan(clip: "WebMClip") -> None:
+    """把退役池非空的 clip 挂到模块级注册表（强引用持有，防 GC 竞态）。"""
+    _ORPHAN_REGISTRY.register(clip)
+
+
+def _unregister_orphan(clip: "WebMClip") -> None:
+    _ORPHAN_REGISTRY.unregister(clip)
+
+
+# ---- 首帧缓存总预算（内存瘦身批，2026-09-03）----
+# 现状问题：每段动画的首帧缓存 ~0.88MB（640×360 RGBA QImage），按内容
+# 规模自然累积（97 段 ≈ 85MB/实例），无总量上限。
+# 预算 LRU：总量超预算时逐出「最久未用」的首帧——冷门动画下次冷播重新
+# 解码（走既有 120ms 有界等待/逃生口路径），热门（待机/点击/最近播放）
+# 常驻。锁序：clip._first_frame_lock → 注册表锁（单向）；逐出在注册表锁外
+# 逐个取 victim 自己的锁，杜绝跨对象持锁嵌套（对照 P2-10 教训）。
+_FIRST_FRAME_BUDGET_BYTES = 32 * 1024 * 1024  # 模块兜底 32MB；应用层以 first_frame_cache_max_mb（默认 8MB，批10-A3）覆盖，32 亦为迁移哨兵值
+# 运行期可调的预算值（set_first_frame_budget 写入）；常量保留为默认值。
+_first_frame_budget_bytes = _FIRST_FRAME_BUDGET_BYTES
+_first_frame_reg_lock = threading.Lock()
+_first_frame_reg: list = []  # [(weakref(clip), bytes)]，尾部 = 最近使用
+_first_frame_bytes = 0
+_ffr_evict_seq = 0
+
+
+def _clip_first_frame_bytes(clip) -> int:
+    img = clip._first_image
+    return 0 if img is None else img.width() * img.height() * 4
+
+
+def _ffr_is_pinned(clip) -> bool:
+    """clip 首帧是否受「绝不逐出」保护（登记选型与清空前复查共用）。
+
+    两类 pin 生命周期不同，必须都认且不可混用同一标志：
+    - _ffr_pinned：library 标记的高频交互核常驻（click/turn/drag，永不来摘）；
+    - _ffr_landing_pinned：弹射飞行期的落地首帧保护（window 起飞打、落地/
+      飞行中断摘）。idle 池可与高频交互常驻集重叠，混用会让落地摘 pin 顺手
+      摘掉常驻保护，点击/拖拽首帧重新暴露在预热浪涌的逐出路径下。
+    """
+    return bool(getattr(clip, '_ffr_pinned', False)
+                or getattr(clip, '_ffr_landing_pinned', False))
+
+
+def _ffr_touch(clip, added_bytes: int = 0) -> list:
+    """登记/置顶 clip 并记账；返回待逐出 (clip, token) 列表（调用方锁外处理）。
+
+    token 机制（R3 复审 P1）：摘表与清空分两阶段，期间的重新登记会把
+    clip._ffr_evict_token 复位为 None，使迟到的逐出在校验时跳过——
+    热门 clip 不会被「过期的逐出决定」误清。
+    """
+    global _first_frame_bytes, _ffr_evict_seq
+    victims = []
+    with _first_frame_reg_lock:
+        live = []
+        for ref, nbytes in _first_frame_reg:
+            other = ref()
+            if other is None:
+                _first_frame_bytes -= nbytes  # 死引用连带账目一并清
+            elif other is clip:
+                _first_frame_bytes -= nbytes  # 旧条目账目移除，下方按现状重计
+            else:
+                live.append((ref, nbytes))
+        current = added_bytes or _clip_first_frame_bytes(clip)
+        live.append((weakref.ref(clip), current))
+        _first_frame_reg[:] = live
+        _first_frame_bytes += current
+        clip._ffr_evict_token = None  # 新登记/置顶 = 取消悬挂中的逐出
+        while _first_frame_bytes > _first_frame_budget_bytes and len(_first_frame_reg) > 1:
+            # 从 LRU 头部找首个可逐出项：死引用/已清缓存顺手清账摘出；
+            # _ffr_is_pinned（常驻交互核 + 飞行期落地 pin，见其文档）跳过不逐
+            # ——否则预热浪涌会把交互首帧挤出去，用户点击/拖拽时被迫 GUI
+            # 同步解码（实测：42 段低优先级 ≈38MB > 预算，交互首帧被逐出后
+            # 看门狗抓到 117~160ms 切换卡顿）。
+            victim = None
+            removed_dead = False
+            for i, (ref, nbytes) in enumerate(_first_frame_reg):
+                c = ref()
+                if c is None or c._first_image is None:
+                    _first_frame_bytes -= nbytes  # 死引用/已清缓存：清账摘出，不算逐出
+                    _first_frame_reg.pop(i)
+                    removed_dead = True
+                    break
+                if _ffr_is_pinned(c):
+                    continue
+                victim = (c, i)
+                break
+            if removed_dead:
+                continue
+            if victim is None:
+                break  # 剩余全是常驻：预算对常驻条目转软上限
+            c, i = victim
+            _ffr_evict_seq += 1
+            c._ffr_evict_token = _ffr_evict_seq
+            victims.append((c, _ffr_evict_seq))
+            _first_frame_bytes -= _first_frame_reg[i][1]
+            _first_frame_reg.pop(i)
+    return victims
+
+
+def set_first_frame_budget(max_bytes: int) -> None:
+    """设置首帧缓存全局预算（启动时由应用层按配置调用一次）。
+
+    只写预算值，不主动逐出——超出部分随后续登记自然逐出（下一次
+    register/置顶触发），避免在 GUI 线程做同步清理。首帧**跨库共享表**
+    （见 _ffr_share_put）用同一个预算值，一起更新。
+    """
+    global _first_frame_budget_bytes, _ffr_share_budget_bytes
+    with _first_frame_reg_lock:
+        _first_frame_budget_bytes = max(0, int(max_bytes))
+    with _ffr_share_lock:
+        _ffr_share_budget_bytes = _first_frame_budget_bytes
+
+
+# ------------------------------------------------------- 首帧解码结果跨库共享
+# 同角色多宠（overlay 单进程多 sprite）各自持一份 MovieLibrary，各自
+# warm_first_frame 同一批素材：同一段素材的首帧被解码 N 遍，每遍拉起一个
+# ffmpeg 子进程（首帧解码 = 一次 spawn + 一次 RGBA 直通解码，实测 60~166ms）。
+# 三库实测 21 次解码里 14 次是纯重复——结果字节相同，而且 clip 侧预算 LRU 会
+# 把兄弟库刚解出来的同一段首帧当"新条目"逐出去，白解一遍又白占一次预算。
+#
+# 这里按**媒体身份**（路径 + mtime_ns + size，与 animation_thumbnail 的磁盘
+# 缓存、_ensure_meta 的 key 同口径）保留首帧解码结果：同进程内任一库解出的
+# 首帧，其它库（以及同步播放/预测式预热路径）直接取用，0 spawn、0 解码。
+#
+# 只存**引用**：取用方拿到的就是同一张 QImage（QImage 隐式共享；既有的
+# _first_image 语义是只读——jumpToFrame 只读它转 QPixmap），因此本表不产生
+# 第二份像素。表自身字节账与 clip 侧首帧预算同值（set_first_frame_budget
+# 同步）且是**硬上界**（见 _ffr_share_trim_locked），故总占用不因共享而放大。
+#
+# 常驻保护：库把高频交互核（click/turn/drag）clip 标成 _ffr_pinned 时，同一
+# 素材在共享表里的那条一并 pin（pin_shared_first_frame）——兄弟库晚几秒才
+# spawn 时，交互核首帧不该因为期间播放别的动画而被逐掉，否则它又要重新
+# spawn 一个 ffmpeg 解一遍（正是本表要消掉的那笔重复）。pin 集只增不减，
+# 规模 = 交互核名字数 × 建过库的角色数（都是短字符串键，且 pin 的落点
+# "素材在表里"由预算硬上界兜住）。
+_ffr_share_lock = threading.Lock()
+_ffr_share: "OrderedDict[str, tuple]" = OrderedDict()  # key -> (QImage, bytes)
+_ffr_share_bytes = 0
+_ffr_share_budget_bytes = _FIRST_FRAME_BUDGET_BYTES
+_ffr_share_pinned: set[str] = set()
+_ffr_share_stats = {'hits': 0, 'misses': 0, 'spawns': 0, 'puts': 0}
+
+
+def _ffr_share_key(path) -> str | None:
+    """共享表键：路径 + mtime_ns + size；素材不可 stat 时返回 None（不共享）。"""
+    try:
+        st = Path(path).stat()
+    except OSError:
+        return None
+    return f"{path}|{st.st_mtime_ns}|{st.st_size}"
+
+
+def _ffr_share_trim_locked() -> None:
+    """超预算逐出最久未用：优先非 pin 条目；全 pin 时**仍逐出最久未用**。
+
+    与 clip 侧 `_ffr_touch`（剩余全是常驻 → 预算转软上限）的差别是有意的：clip 侧
+    的常驻条目由 clip 拥有，clip 终结即随 weakref 清账、内存自动回落；本表的条目
+    由表强引用持有，若也转成软上限，切角色反复建库会让"每角色交互核"的键越积越
+    多（7 段 × 角色数 × 0.88MB）而永不释放。因此这里的预算保持**硬上界**：pin 只
+    在还有别的条目可逐时起保护作用（正是"兄弟库还没 spawn 完"那个窗口）。
+    """
+    global _ffr_share_bytes
+    while _ffr_share_bytes > _ffr_share_budget_bytes and len(_ffr_share) > 1:
+        victim = next((key for key in _ffr_share if key not in _ffr_share_pinned),
+                      None)
+        if victim is None:
+            victim = next(iter(_ffr_share))  # 全常驻：仍逐最久未用（硬上界）
+        _ffr_share_bytes -= _ffr_share.pop(victim)[1]
+
+
+def _ffr_share_put_locked(key: str, img) -> None:
+    global _ffr_share_bytes
+    nbytes = img.width() * img.height() * 4
+    old = _ffr_share.pop(key, None)
+    if old is not None:
+        _ffr_share_bytes -= old[1]
+    _ffr_share[key] = (img, nbytes)
+    _ffr_share_bytes += nbytes
+    _ffr_share_stats['puts'] += 1
+    _ffr_share_trim_locked()
+
+
+def share_first_frame(path, img) -> None:
+    """发布一段素材的首帧解码结果（解码完成后调用；img 为空时 no-op）。"""
+    if img is None:
+        return
+    key = _ffr_share_key(path)
+    if key is None:
+        return
+    with _ffr_share_lock:
+        _ffr_share_put_locked(key, img)
+
+
+def shared_first_frame(path):
+    """取用其它库已解出的首帧（同一 QImage 对象）；未命中返回 None。"""
+    key = _ffr_share_key(path)
+    with _ffr_share_lock:
+        if key is None:
+            _ffr_share_stats['misses'] += 1
+            return None
+        entry = _ffr_share.get(key)
+        if entry is None:
+            _ffr_share_stats['misses'] += 1
+            return None
+        _ffr_share.move_to_end(key)
+        _ffr_share_stats['hits'] += 1
+        return entry[0]
+
+
+def shared_first_frame_ready(path) -> bool:
+    """只探测共享表里是否已有该素材的首帧（不动 LRU 序、不计命中/未命中）。
+
+    供兄弟库预热前的有界等待用：等到了再走正常预热（clip 侧从共享表取用，
+    0 spawn），不必自己解一遍同一素材。
+    """
+    key = _ffr_share_key(path)
+    if key is None:
+        return False
+    with _ffr_share_lock:
+        return key in _ffr_share
+
+
+def pin_shared_first_frame(path) -> None:
+    """常驻保护一段素材的共享首帧（高频交互核；见本节的"常驻保护"说明）。"""
+    key = _ffr_share_key(path)
+    if key is None:
+        return
+    with _ffr_share_lock:
+        _ffr_share_pinned.add(key)
+        entry = _ffr_share.get(key)
+        if entry is not None:
+            _ffr_share.move_to_end(key)
+
+
+def bump_first_frame_spawns() -> None:
+    """记一笔"真的要为某段素材拉起 ffmpeg 解首帧"（共享未命中时调用）。"""
+    with _ffr_share_lock:
+        _ffr_share_stats['spawns'] += 1
+
+
+def first_frame_share_stats() -> dict:
+    """共享表取证快照（命中/未命中/真实 spawn 次数 + 占用）。"""
+    with _ffr_share_lock:
+        return {
+            **_ffr_share_stats,
+            'entries': len(_ffr_share),
+            'bytes': _ffr_share_bytes,
+            'pinned': len(_ffr_share_pinned),
+            'budget': _ffr_share_budget_bytes,
+        }
+
+
+def reset_first_frame_share() -> None:
+    """清空共享表与计数（测试收口：跨用例不残留首帧引用）。"""
+    global _ffr_share_bytes
+    with _ffr_share_lock:
+        _ffr_share.clear()
+        _ffr_share_pinned.clear()
+        _ffr_share_bytes = 0
+        for key in _ffr_share_stats:
+            _ffr_share_stats[key] = 0
+
+
+def _ffr_unregister(clip) -> None:
+    """clip 终结时摘出注册表并清账（cleanup 调用）。"""
+    global _first_frame_bytes
+    with _first_frame_reg_lock:
+        live = []
+        for ref, nbytes in _first_frame_reg:
+            other = ref()
+            if other is None or other is clip:
+                _first_frame_bytes -= nbytes
+            else:
+                live.append((ref, nbytes))
+        _first_frame_reg[:] = live
+    clip._ffr_evict_token = None
+
+
+def _ffr_evict(victims) -> None:
+    """锁外逐出：逐个取 victim 自己的首帧锁，校验 token 未过期才清空。"""
+    for victim, token in victims:
+        try:
+            with victim._first_frame_lock:
+                if victim._ffr_evict_token != token:
+                    continue  # 摘表后被重新登记/置顶：本次逐出决定已过期
+                if _ffr_is_pinned(victim):
+                    continue  # 选型后被 pin（如起飞保护落地首帧）：逐出决定已
+                    # 过期——"绝不逐出"语义下，登记处选型与这里清空之间有
+                    # 窗口期，必须按 _ffr_is_pinned 复查（常驻 + 飞行期 pin）
+                victim._first_image = None
+                victim._ffr_evict_token = None
+        except Exception:
+            pass  # clip 可能正在 cleanup，逐出失败无碍（其清理路径自会释放）
+
+
+# ------------------------------------------------------------ 内存取证（DSPET_MEM_DEBUG=1）
+# 诊断专用（机制见 pet/mem_debug.py）：登记本模块的 reader 帧队列、首帧
+# 缓存、spawn/消费计数，供 ticker 每 60s 输出一行，与外部采样的
+# PrivateMemorySize64 曲线按时间轴对齐，找出「跟内存同涨」的那个计数。
+# 关闭（默认）时所有计数点被 `mem_debug.ENABLED` 短路——正常路径零行为、
+# 零额外分配；队列用 weakref 登记，绝不延长 reader/clip 寿命。
+_MEM_CLIPS: "weakref.WeakSet" = weakref.WeakSet()
+
+
+def _mem_debug_collector() -> dict:
+    samples = mem_debug.live_readers()
+    q_frames = sum(n for _label, n, _b in samples)
+    q_bytes = sum(b for _label, _n, b in samples)
+    with _first_frame_reg_lock:
+        ff_clips = sum(1 for ref, _n in _first_frame_reg if ref() is not None)
+        ff_bytes = _first_frame_bytes
+    # 显示槽保留（原生内存嫌疑点，2026-09-17）：QImage/QPixmap 的像素数据由
+    # Qt 侧 malloc，tracemalloc 看不见——若某条切换路径没清旧 clip 的显示槽，
+    # 就会以「每段动画 ~1.8MB」的速度在原生堆上累积（Python 堆保持全平）。
+    img_clips = img_bytes = pm_clips = pm_bytes = 0
+    try:
+        for clip in list(_MEM_CLIPS):
+            img = getattr(clip, '_current_image', None)
+            if img is not None:
+                try:
+                    img_clips += 1
+                    img_bytes += img.width() * img.height() * 4
+                except RuntimeError:
+                    pass
+            pm = getattr(clip, '_current_pixmap', None)
+            if pm is not None:
+                try:
+                    pm_clips += 1
+                    pm_bytes += pm.width() * pm.height() * 4
+                except RuntimeError:
+                    pass
+    except RuntimeError:
+        pass
+    detail = ','.join(
+        f'{label}:{n}f/{b // 1024}K' for label, n, b in samples
+    ) or '-'
+    return {
+        'clips': len(_MEM_CLIPS),
+        'readers': len(samples),
+        'q_frames': q_frames,
+        'q_bytes': q_bytes,
+        'ff_bytes': ff_bytes,
+        'ff_clips': ff_clips,
+        'img_clips': img_clips,
+        'img_bytes': img_bytes,
+        'pm_clips': pm_clips,
+        'pm_bytes': pm_bytes,
+        'reader_q': detail,
+    }
+
+
+if mem_debug.ENABLED:
+    mem_debug.register_collector(_mem_debug_collector)
+
+
+class _Reader:
+    """一个 reader 线程 + 其持有的底层 ffmpeg 进程句柄。
+
+    kill_attempts / abandoned（批 6-8b R3）：线程退出后的兜底确认
+    （_confirm_retired_proc）失败时保留记录并累计重试次数；达到
+    _CONFIRM_KILL_MAX 上限标注 abandoned（保留追踪、sweep 不再重试），
+    绝不静默丢弃句柄。
+    """
+
+    __slots__ = ("thread", "proc", "kill_attempts", "abandoned")
+
+    def __init__(self, thread: threading.Thread, proc: subprocess.Popen | None) -> None:
+        self.thread = thread
+        self.proc = proc
+        self.kill_attempts = 0
+        self.abandoned = False
+
+    def join(self, timeout: float | None = None) -> None:
+        self.thread.join(timeout)
+
+
+class _PopenCapture:
+    """跨线程透明的 subprocess.Popen 包装，用于捕获 reader 线程拉起的 ffmpeg 进程句柄。
+
+    - 安装一次（幂等、加锁防并发）：把 imageio_ffmpeg._io 模块内的 `subprocess`
+      引用替换为一个代理模块（其余属性原样透传、仅 Popen 换成 _wrapped），
+      只影响 imageio_ffmpeg 的 Popen 调用；进程内全局 subprocess.Popen 保持原样
+      ——不能全局替换，否则会破坏 `class X(subprocess.Popen)` 这类继承用法
+      （asyncio.windows_utils 就是这样，会导致 unittest.mock 导入失败）。
+    - 仅「进入 capture 上下文」的线程（reader 线程）会把新建进程记入自己的
+      _procs 列表并可即时回调（on_process）；其余线程完全无感。
+    - 即时回调让 stop() 在 reader 尚处于 ffmpeg 头部解析（可能卡住）时也能
+      拿到进程句柄并主动 terminate，而不是等 reader 自己退。
+    - 孤儿防护（2026-09-17）：**每一个**经本漏斗拉起的 ffmpeg 子进程在 Popen
+      返回后立即挂进模块级 Job Object（KILL_ON_JOB_CLOSE）——父进程被
+      Stop-Process/任务管理器强杀（TerminateProcess，任何清理代码都不执行）
+      时由内核连带终止，修「每次强杀残留一个 ffmpeg」的实机问题。实现与
+      取舍见 pet/win_job.py；非 Windows / job 创建失败时为空操作。
+    """
+
+    _install_lock = threading.Lock()
+    _installed = False
+    _real_popen = subprocess.Popen
+    _local = threading.local()
+
+    def __init__(self, on_process=None) -> None:
+        self._on_process = on_process
+        self._procs: list[subprocess.Popen] = []
+        self._prev: _PopenCapture | None = None
+
+    def __enter__(self) -> "_PopenCapture":
+        self._install()
+        self._prev = getattr(self._local, "capture", None)
+        self._local.capture = self
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        if self._prev is None:
+            try:
+                del self._local.capture
+            except AttributeError:
+                pass
+        else:
+            self._local.capture = self._prev
+        return False
+
+    @property
+    def process(self) -> subprocess.Popen | None:
+        """最近拉起的进程（解码进程；ffmpeg exe 探测进程在其之前）。"""
+        return self._procs[-1] if self._procs else None
+
+    @classmethod
+    def _install(cls) -> None:
+        if cls._installed:
+            return
+        with cls._install_lock:
+            if cls._installed:
+                return
+            cls._real_popen = subprocess.Popen
+            io_mod = sys.modules.get("imageio_ffmpeg._io")
+            if io_mod is not None and getattr(io_mod, "subprocess", None) is subprocess:
+                proxy = types.ModuleType("subprocess")
+                proxy.__dict__.update(subprocess.__dict__)
+                proxy.Popen = cls._wrapped  # type: ignore[assignment]
+                io_mod.subprocess = proxy
+            cls._installed = True
+
+    @classmethod
+    def _wrapped(cls, *args, **kwargs):
+        proc = cls._real_popen(*args, **kwargs)
+        # 孤儿防护：挂早不挂晚（Popen 刚返回，进程几乎不可能已退出）。这里
+        # 是所有 imageio-ffmpeg 解码进程的唯一漏斗（read_frames/write_frames
+        # 都经它），失败只降级为「不防护」，绝不影响播放路径。
+        win_job.adopt(proc)
+        if mem_debug.ENABLED:
+            # 取证（DSPET_MEM_DEBUG=1）：区分解码进程（-i 素材）与 exe 探测。
+            try:
+                argv = args[0] if args else None
+                decode = isinstance(argv, (list, tuple)) and "-i" in argv
+                mem_debug.bump('ff_spawn_dec' if decode else 'ff_spawn_probe')
+            except Exception:
+                pass
+        state = getattr(cls._local, "capture", None)
+        if state is not None:
+            state._procs.append(proc)
+            if state._on_process is not None:
+                try:
+                    state._on_process(proc, args[0] if args else None)
+                except Exception:
+                    pass
+        return proc
+
+
+def _meta_cache_source_path(key: str) -> str:
+    """从 meta 缓存 key 还原源文件路径。
+
+    key 形如 ``<path>|<mtime_ns>|<size>``（``_ensure_meta``），stat 失败时退化为
+    裸 ``<path>``。尾部两段都能当数字才认定是版本后缀——路径里带 ``|`` 的
+    极端情况不会被误切。
+    """
+    head, sep, size = key.rpartition("|")
+    if sep and size.isdigit():
+        path, sep2, mtime = head.rpartition("|")
+        if sep2 and mtime.isdigit():
+            return path
+    return key
+
+
+def _prune_dead_meta_file_cache(cache: dict) -> int:
+    """逐出源文件已不存在的条目，返回逐出条数（N3，2026-09-29 审计）。
+
+    pytest 临时路径这类条目在源文件删掉后永不失效（key 的 ``(mtime+size)``
+    再也没有匹配者），跨运行常驻在 ``%TEMP%/dsh-pet-media-meta-cache.json`` 里。
+    只在本进程第一次读该文件时做一次全表体检（``_get_meta_file_cache``），逐出的
+    key 记入 :data:`_META_FILE_CACHE_DEAD` 供后续落盘复用——**不进** ``_ensure_meta``
+    热路径，条数上限语义不变。
+
+    体检实现：按父目录分组、每组一次 ``os.scandir`` 列名单比对，而不是逐条
+    ``os.path.exists``。本机实测（真实缓存 4972 条 / 139 个目录）：分组 34.9ms vs
+    逐条 462.6ms（Windows 上逐条 stat 病态昂贵，见 ``ByteOffsetTailer`` 注释）。
+    判定等价：目录列不出来 = 其下所有源文件都不存在。文件名比对用
+    ``os.path.normcase``：Windows 上折叠大小写（路径大小写不敏感，同一文件的
+    大小写变体算「存在」）；posix 上恒等（路径大小写敏感，``/tmp/A`` 与
+    ``/tmp/a`` 是两个不同文件，无条件折叠会把不存在的那一个误判为存活、
+    永远逐不出去）。
+    """
+    groups: dict[str, dict[str, list[str]]] = {}
+    for key in cache:
+        parent, name = os.path.split(_meta_cache_source_path(key))
+        groups.setdefault(parent, {}).setdefault(name, []).append(key)
+    dead: list[str] = []
+    for parent, names in groups.items():
+        try:
+            listed = {entry.name for entry in os.scandir(parent or os.curdir)}
+        except OSError:
+            for keys in names.values():   # 目录没了 / 读不了：其下条目一律视为死
+                dead.extend(keys)
+            continue
+        existing = {os.path.normcase(entry) for entry in listed}
+        for name, keys in names.items():
+            if os.path.normcase(name) not in existing:
+                dead.extend(keys)
+    for key in dead:
+        cache.pop(key, None)
+    _META_FILE_CACHE_DEAD.update(dead)
+    return len(dead)
+
+
+def _load_meta_file_cache() -> dict:
+    try:
+        raw = json.loads(_META_FILE_CACHE_PATH.read_text(encoding="utf-8"))
+        return raw if isinstance(raw, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _prune_meta_file_cache(cache: dict) -> None:
+    """磁盘 meta 缓存条数上限（P2 审计）：跨进程/跨运行单调累积且从不
+    清理——无界；在写路径（读盘合并后）与加载路径按「先写入先逐出」裁到
+    _META_FILE_CACHE_MAX_ENTRIES（无访问时间戳，近似 LRU 的卫生上限，
+    预算为硬上界）。正常使用远够不到；逐出条目由需要它的实例以一次
+    ffmpeg 探测自愈，无正确性影响。"""
+    while len(cache) > _META_FILE_CACHE_MAX_ENTRIES:
+        cache.pop(next(iter(cache)))
+
+
+def _get_meta_file_cache() -> dict:
+    global _META_FILE_CACHE
+    if _META_FILE_CACHE is None:
+        _META_FILE_CACHE = _load_meta_file_cache()
+        _prune_meta_file_cache(_META_FILE_CACHE)  # 历史超限文件：内存即有界
+        # N3：本进程第一次读到这份文件时体检一遍死条目（源文件已删的那种），
+        # 结论同时交给写路径把磁盘文件缩小——整条链只在加载/落盘边界花钱。
+        _prune_dead_meta_file_cache(_META_FILE_CACHE)
+    return _META_FILE_CACHE
+
+
+def _meta_cache_file_lock():
+    """跨进程互斥锁文件（批 6-8b 修 3）：让「读盘→合并→原子替换」成为
+    read-modify-write 临界区，保证多开实例的缓存单调累积——后写进程不会用
+    旧进程内快照覆盖先写进程刚加入的条目（5.6sol 全审 P2）。
+
+    返回持锁文件对象（调用方在 finally 中 close 即释放锁）；平台不支持
+    （非 Windows/POSIX）或锁获取超时/失败时返回 None——调用方退化为纯
+    「写前重读合并」（仍优于旧实现的进程内快照覆盖，仅余极小竞态窗口，
+    且每个条目仍以（mtime+size）key 幂等）。锁文件与缓存文件分离：
+    缓存文件用 tmp+replace 原子替换，锁文件固定不变（不随替换消失）。
+    """
+    lock_path = _META_FILE_CACHE_PATH.with_suffix(
+        _META_FILE_CACHE_PATH.suffix + ".lock"
+    )
+    try:
+        f = open(lock_path, "a+b")
+    except OSError:
+        return None
+    try:
+        # 保证至少 1 字节可锁（msvcrt.locking 从当前位置起锁；空文件位置 0
+        # 也可锁，写 1 字节更稳）
+        f.seek(0, 2)
+        if f.tell() == 0:
+            f.write(b"\x00")
+            f.flush()
+        deadline = time.monotonic() + 1.0  # 有界等待，绝不长期阻塞
+        while True:
+            try:
+                f.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+                    msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return f
+            except OSError:
+                if time.monotonic() >= deadline:
+                    f.close()
+                    return None
+                time.sleep(0.005)
+    except Exception:
+        try:
+            f.close()
+        except Exception:
+            pass
+        return None
+
+
+def _save_meta_file_cache_entry(key: str, frames: int, duration: float) -> None:
+    global _META_FILE_CACHE
+    try:
+        with _META_CACHE_LOCK:
+            lock = _meta_cache_file_lock()
+            try:
+                # 写前重读磁盘合并（read-modify-write，批 6-8b 修 3）：其他
+                # 进程可能刚写入了新条目，绝不用进程内旧快照覆盖它们——
+                # 缓存单调累积，多开预热不重复探测。跨进程临界区由
+                # _meta_cache_file_lock 提供（有界等待，失败退化为重读合并）。
+                cache = _load_meta_file_cache()
+                # N3：加载边界体检出的死条目（源文件已删）顺手从磁盘文件里带走。
+                # 结论复用一次全表体检，这里只花集合查找的钱。
+                for dead_key in _META_FILE_CACHE_DEAD:
+                    cache.pop(dead_key, None)
+                cache[key] = {
+                    "frames": frames,
+                    "duration": duration,
+                }
+                # 条数上限（P2 审计）：合并后裁到硬上限，防长期跨运行无界增长
+                _prune_meta_file_cache(cache)
+                # 进程内快照同步为合并结果（原子换引用；后续读取即命中）
+                _META_FILE_CACHE = cache
+                # tmp 名带 PID：共享临时目录下防符号链接预占攻击与多实例互抢
+                tmp = _META_FILE_CACHE_PATH.with_suffix(f".{os.getpid()}.tmp")
+                tmp.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
+                tmp.replace(_META_FILE_CACHE_PATH)
+            finally:
+                if lock is not None:
+                    try:
+                        lock.close()
+                    except OSError:
+                        pass
+    except OSError:
+        pass
+
+try:
+    import imageio_ffmpeg
+    from .ffmpeg_hide import install as _install_ffmpeg_hide
+
+    _install_ffmpeg_hide()
+except Exception as exc:  # pragma: no cover - 依赖缺失时无法使用 webm 路线
+    imageio_ffmpeg = None
+    _IMPORT_ERROR = exc
+else:
+    _IMPORT_ERROR = None
+
+
+class WebMClip(QObject):
+    """与窗口层期望的媒体播放器接口兼容的 webm 播放器。
+
+    首帧预热可被**兄弟库取用**（``FIRST_FRAME_WARM_ADOPTABLE``）：同角色多宠时
+    首帧冷路径要 spawn 一个 ffmpeg（60~166ms），兄弟库不必各解一遍同一段素材——
+    预热前有界等一会（库侧 ``MovieLibrary._await_peer_first_frame``），等到了就从
+    ``webm_clip`` 的跨库首帧共享表取用（同一张 QImage：0 spawn、0 解码）。
+    """
+
+    FIRST_FRAME_WARM_ADOPTABLE = True
+
+    frameChanged = Signal(int)
+    finished = Signal()
+    errorOccurred = Signal(str)
+
+    def __init__(self, path, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        if mem_debug.ENABLED:
+            _MEM_CLIPS.add(self)  # 取证用弱引用登记（clip 存活数；不延长寿命）
+        self.path = path
+        self._w = catalog.CANVAS_W
+        self._h = catalog.CANVAS_H
+        self._bpp = 4  # RGBA
+
+        # 元数据（惰性填充；由 MovieLibrary 并行 warm 或首次使用时读取）
+        self._frame_count = 0
+        self._duration = 0.0
+        self._fps = 24.0
+        self.playback_speed = 1.0
+
+        # 播放状态
+        self._queue: queue.Queue = queue.Queue(maxsize=8)
+        self._stop_evt = threading.Event()
+        self._thread: threading.Thread | None = None
+        # 当前 active reader 持有的 ffmpeg 进程句柄（_reader_lock 保护，reader 线程
+        # 注册、GUI 线程 stop 时读取/清空并 terminate）。
+        self._reader_proc: subprocess.Popen | None = None
+        self._reader_lock = threading.Lock()
+        # Popen 操作串行化锁（批 6-8b）：播放 reader 的 ffmpeg Popen 的「操作」
+        # （poll/terminate/wait/kill/关管道）任意时刻只允许一个线程执行。Windows
+        # 上两线程并发操作同一 Popen（如 GUI stop 的 terminate/wait 与 reader
+        # finally 的 _terminate_proc/gen.close() 关管道）是原生竞态崩溃
+        # （access violation）的根因。与 _reader_lock（状态锁，瞬时持有）分离：
+        # terminate/gen.close 等最长可达 ~1s 的操作不阻塞状态链（_register
+        # 登记、start() 残留摘取等）。阻塞读（generator 内 stdout.read）不持锁
+        # ——它只与 GUI 的「最小 terminate」并发（进程句柄 vs 管道句柄，不同
+        # 原生对象），是解除阻塞读的既定安全配对（B7 注释「正在阻塞读管道的
+        # reader 会因进程终止而立即解除阻塞退出」）。
+        self._proc_lock = threading.Lock()
+        # 首帧解码进程的 Popen 操作锁（批 6-8b）：与 _proc_lock 同语义，独立
+        # 成锁避免首帧解码收尾（g.close() 最长 ~1.5s 病态）阻塞播放 reader 的
+        # stop 解除阻塞——两类 Popen 互不相交，锁也互不相交。
+        self._ff_proc_lock = threading.Lock()
+        # reader 已拉起并登记 ffmpeg 进程（或确定无进程）的信号；每轮 start() 重建。
+        # 测试 seam：仅供测试注入，产品侧无调用
+        self._reader_ready = threading.Event()
+        # 退役 reader 池（有硬上限）：thread + 其 ffmpeg 进程句柄的记录列表。
+        self._retired: list[_Reader] = []
+        # 解码节流比率（闲置降帧联动，批11）：1 = 不节流（非闲置路径零变化）；
+        # >1 时消费端 QTimer interval ×ratio、reader 按目标呈现节奏阻塞
+        # （q.put 有界重试不丢帧）——管道写满让 ffmpeg 阻塞在 write()，
+        # 解码速率随消费端联动下降 ≈ 原始帧率/ratio。比率由窗口层经
+        # set_decode_throttle 推送（可配置接口，默认跟随闲置降帧除数）。
+        # 主线程写、reader 线程读（int 赋值在 CPython 下原子，GIL 保证，
+        # 与 _generation 的跨线程读取同一模式）。必须在 _timer 初始化前
+        # 赋值（_timer_interval 会读它）。
+        self._decode_throttle_divisor = 1
+        # 批5.3 共享解码：hub 接管源 clip 的解码 pace（有效 divisor =
+        # min(在挂消费者期望值)）。置位后窗口层 _sync_movie_throttle 不再直接
+        # 推 divider（改经 hub._report_desired_throttle 上报），避免覆盖 hub 仲裁。
+        # 主线程写（hub GUI 线程）、窗口 setter 读；bool 赋值在 CPython GIL 下原子。
+        self._decode_pace_external = False
+        # 批11-B1：ffmpeg 圈边界定期回收阈值（秒；0 = 关闭回收）。窗口层经
+        # set_recycle_minutes 推送 config 的 ffmpeg_recycle_minutes（分钟，
+        # 默认 10）。构造默认 0（关闭）：未经窗口推送的 clip（直接测试等）
+        # 保持现状逐位一致。主线程写（setter）、reader 线程读（_loop_boundary
+        # 的 _recycle_due），float 赋值在 CPython GIL 下原子，与
+        # _decode_throttle_divisor 的跨线程读同一模式。
+        self._recycle_seconds = 0.0
+        # 当前 ffmpeg 进程出生时刻（time.monotonic 秒）与已完成圈数（均 reader
+        # 线程写）；圈边界回收判定/日志用。0.0 = 尚未拉起本进程（feed 路径）。
+        self._reader_born_at = 0.0
+        self._reader_loops = 0
+        self._timer = QTimer(self)
+        self._timer.setTimerType(Qt.TimerType.PreciseTimer)
+        self._timer.setInterval(self._timer_interval())
+        self._timer.timeout.connect(self._poll)
+        # 待落地的消费节拍间隔（见 _apply_interval）：运行中真变速时排到下一次
+        # timeout 落地，避免重设 QTimer 截断当拍倒计时。
+        self._pending_interval: int | None = None
+        # 播放节拍暂停（O3）：隐藏/挂起期为 True——消费端定时器停摆（不再
+        # _poll），播放位置/队列/显示图原地保留；reader 由有界帧队列背压自然
+        # 停步。恢复走 resume()，从暂停处续播（绝不回第 0 帧、不重新拉进程）。
+        self._paused = False
+        # 共享解码（默认 None = 今天的行为逐位不变）：
+        # - _publish_sink：发布端（首发窗）播放时置（facade 在 start() 前设置）
+        #   ——reader 线程每解码一帧回调 sink.on_frame(data, src_idx)，扇出到
+        #   各订阅者环形缓冲；
+        # - _feed_source：消费端置（facade 在 start() 前设置）——reader 线程
+        #   经 FanoutFeed 立即就绪（ready 恒 True），从环取帧入队；断流/中止
+        #   → 同一 reader 线程内回退本地 ffmpeg（帧 0）。
+        self._publish_sink = None
+        self._feed_source = None
+        # cleanup 后 clip 终结：不再启动新 reader；退役池回收由模块级
+        # 生命周期管理器持有（见模块头注释，P2）。
+        self._cleaned = False
+
+        self._current_image: QImage | None = None
+        self._current_pixmap: QPixmap | None = None
+        self._first_image: QImage | None = None
+        self._ffr_evict_token = None  # 首帧预算 LRU 的逐出代次（见模块级注册表注释）
+        # 首帧解码原子认领（N4）：warm_first_frame（后台线程）同一时间只有一个
+        # 执行者；GUI 线程永不同步解码（冷路径 100-337ms 冻结，实测定案）——
+        # jumpToFrame 冷路径不 kick 任何解码，旧帧由窗口顶着，播过留热由
+        # _process_frame 的源帧 0 顺手写缓存兜底。
+        self._first_frame_lock = threading.Lock()
+        self._first_frame_done = threading.Event()
+        # 首帧解码生命周期（P1-2）：与播放 reader 同一回收体系。
+        # _first_frame_gen 是首帧解码代次：cancel_first_frame_warm/cleanup 时自增，
+        # 使在飞解码的结果作废（不写入缓存）；_first_frame_procs 登记在飞首帧
+        # 解码拉起的 ffmpeg 进程句柄（_reader_lock 保护），取消/cleanup 时主动
+        # terminate，隐藏/切角色后不再有不受控的后台 ffmpeg 存活。
+        self._first_frame_gen = 0
+        self._first_frame_procs: set = set()
+        # 取消时 try-acquire 超时跳过、或 terminate 未能确认退出的首帧进程
+        # （批 6-8b 收尾；R3 条目格式 [proc, attempts, abandoned, tracked_at]）：
+        # _reader_lock 保护。
+        # cancel_first_frame_warm 的超时跳过依赖解码线程 finally 的 g.close()
+        # 杀进程——该保证是条件性的（g.close 异常被吞等病态路径会漏），登记后
+        # 由孤儿注册表 sweep（_sweep_unconfirmed_procs）在 owner 释放
+        # _ff_proc_lock 后确认/补杀；确认失败保留条目并累计有界重试，达到上限
+        # 告警并标注 abandoned，其后一轮 sweep 终局处置（记审计日志 + 清出追踪，
+        # 不再钉住 clip）——闭合「取消绝不留存活 ffmpeg」的最终保障，绝不静默
+        # 丢句柄。
+        self._unconfirmed_procs: list = []
+        self._frame_index = 0
+        # 显示帧索引 = 素材源时间线上的 0-based 帧号（reader 打标，丢帧后
+        # 仍一致）；与 1-based 播放计数 _frame_index 分离（P1 复审）。
+        self._current_frame_index = 0
+        self._ended_fired = False
+        self._running = False
+        self._generation = 0
+        # 进程内循环（批8）：reader 在每圈边界交付结束标记后驻留 _loop_gate
+        # 等续圈；_natural_end_pending 标记「末帧/结束标记已交付」（区分圈末
+        # 自然结束与中途打断——前者的 stop() 软停保进程，后者硬停杀进程）；
+        # _soft_parked = 软停驻留中（start() 据此走 re-arm 续圈）；
+        # _reader_parked = reader 正驻留在圈边界（reader 线程写、GUI 读——
+        # 软停只对「确认驻留在循环边界」的 reader 生效，feed 路径/正在退出
+        # 的 reader 绝不软停）；
+        # _boundary_marker_pending = 本圈结束标记已发出（reader 置位，re-arm
+        # 复位）；_rearm_pending 由 re-arm 在标记未发出时置位，reader 到边界
+        # 看到它就跳过标记直接续圈——两个标记位共同保证「一圈结束至多上报
+        # 一次，且下一圈边界绝不误跳过」（_loop_lock 内互斥判定）。
+        self._loop_gate = threading.Event()
+        self._loop_lock = threading.Lock()
+        self._rearm_pending = False
+        self._boundary_marker_pending = False
+        self._reader_parked = False
+        self._soft_parked = False
+        self._natural_end_pending = False
+        # re-arm 唤醒握手（P1-2）：reader 唤醒续圈后置位，re-arm 有界等待；
+        # 等不到 = reader 已在退出（is_alive 的 finally 窗口），落回 fresh start。
+        self._loop_ack = threading.Event()
+        # 帧数精确性（批8 P2-5）：仅 count_frames_and_secs（或其缓存）算精确；
+        # reader/首帧路径从流头 fps×duration 估算的回填不算。进程内循环的
+        # 取模回绕只在精确帧数下启用（估算 ±1 会逐圈相位漂移）。
+        self._frame_count_exact = False
+
+        # 销毁清理（Fix A1）：绝不连接「自身 bound-method」槽——PySide6 在
+        # C++ 删除对象时【从不】调用它（调查实证：lambda/外部对象方法才会被
+        # 调用），那会让 cleanup() 缺席、reader 变僵尸。改连无 receiver 的
+        # callable；lambda 捕获 self 会形成引用环（clip→连接→lambda→clip），
+        # 由 cleanup() 内显式断开（_destroyed_conn）打破，C++ 删除时 Qt 也会
+        # 清理连接兜底。
+        self._destroyed_conn = self.destroyed.connect(
+            lambda *_: WebMClip._destroyed_cleanup(self)
+        )
+
+    @staticmethod
+    def _destroyed_cleanup(clip: "WebMClip") -> None:
+        """C++ 对象销毁时经 destroyed 信号回调（无 receiver callable）。"""
+        clip.cleanup()
+
+    def __del__(self) -> None:
+        try:
+            self.cleanup()
+        except RuntimeError:
+            pass  # 解释器退出期 Qt C++ 对象可能已先销毁，此时无需清理
+
+    def cleanup(self) -> None:
+        """销毁/清理：terminate active reader 的 ffmpeg，退役并回收。
+
+        对仍存活的退役 reader 保留追踪（绝不静默丢弃）：clip 及其 _Reader
+        记录交由模块级生命周期管理器持有（_ORPHAN_REGISTRY），持续回收直到
+        线程退出——绝不随 clip GC 丢弃追踪，也不与 reader 线程的收尾竞态
+        （Windows 原生崩溃的根因，见模块头注释）。cleanup 后 clip 终结
+        （_cleaned），自身不再安排任何 sweep/timer。
+        """
+        # 断开 destroyed 的 lambda 连接（Fix A1）：lambda 捕获 self 形成
+        # 引用环，显式断开让 Python GC 可回收；C++ 已删场景直接跳过——
+        # 否则 libpyside 在 Python except 之前先打 RuntimeWarning 噪音
+        # （审查 DS-L3）。
+        conn = getattr(self, '_destroyed_conn', None)
+        if conn is not None:
+            import shiboken6
+            if shiboken6.isValid(self):
+                try:
+                    self.destroyed.disconnect(conn)
+                except RuntimeError:
+                    pass
+            self._destroyed_conn = None
+        self._cleaned = True
+        self.cancel_first_frame_warm()
+        # 释放首帧缓存（内存瘦身批）：clip 终结后缓存无意义，同时摘出预算
+        # 注册表清账
+        try:
+            with self._first_frame_lock:
+                self._first_image = None
+        except Exception:
+            pass
+        _ffr_unregister(self)
+        try:
+            # 必须硬停：圈末软停（批8）会保留 ffmpeg 进程等续圈，cleanup
+            # 是终结路径，绝不保留进程驻留。
+            self._hard_stop()
+        except RuntimeError:
+            pass  # QTimer 等 Qt 子对象已随 C++ 侧销毁
+        self._reap_retired(join_timeout=_RECLAIM_JOIN_TIMEOUT)
+        if self._retired:
+            # 终端短宽限：吸收「进程已 terminate、线程收尾仅差调度」的尾差，
+            # 降低 cleanup 后仍有存活退役 reader 的偶发概率（满载 CI/macOS）。
+            self._retire_grace_wait()
+        if self._retired or self._has_unconfirmed_procs():
+            # 仍存活 reader 或未确认退出的首帧进程：保持模块级持有，由管理器
+            # 继续回收/补杀（批 6-8b 收尾：_unconfirmed_procs 非空也必须留
+            # 在注册表，否则 sweep 不会再来补杀）。
+            _register_orphan(self)
+        else:
+            _unregister_orphan(self)
+
+    def _retire_grace_wait(self, grace: float = _CLEANUP_RETIRE_GRACE_S) -> None:
+        """cleanup 终结路径专用：短步进轮询等存活退役 reader 收尾。
+
+        非热路径（stop()/sweep 已退出的 reader 本就 ≤1s 自灭，不需要也不应
+        为此垫 GUI 阻塞）。仅在 cleanup 首次 reap 后仍有存活者时调用：
+        每轮 join(0.05) 唤醒调度 + reap(0) 清已退出记录，直到退役池清空或
+        总宽限耗尽；仍存活者由调用方继续交给孤儿注册表 sweep 回收。
+        """
+        deadline = time.monotonic() + grace
+        while self._retired and time.monotonic() < deadline:
+            for r in list(self._retired):
+                try:
+                    r.thread.join(timeout=0.05)
+                except Exception:
+                    pass
+            self._reap_retired(join_timeout=0)
+
+    def _reap_retired(self, join_timeout: float) -> None:
+        """回收退役池：丢弃已确认退出的记录；对仍存活者有界 join；仍不退出
+        或兜底确认失败则保留在池中（绝不静默丢弃追踪），由模块级管理器
+        持续重试。
+
+        兜底确认（批 6-8b 收尾；R3 闭合 R2 复审 P1）：只在「reader 线程
+        已退出」后触碰其 proc——线程退出意味着 finally 已完整执行
+        （_terminate_proc + gen.close() 是杀进程的主保证），此刻不存在与
+        reader 收尾的并发 Popen 操作，可安全做「reader finally 之外的兜底
+        确认」：句柄仍存活（_terminate_proc / gen.close 的异常被吞的病态
+        路径）则补杀。确认失败（poll 异常 / terminate+kill 后仍存活）时
+        **保留记录**并累计重试次数，达到 _CONFIRM_KILL_MAX 上限告警并标注
+        abandoned（保留追踪不再重试）——绝不静默丢弃句柄。这闭合了
+        try-acquire 超时跳过（_unblock_proc）依赖 owner 进 finally 杀进程的
+        条件保证——即使 owner 因异常未能杀成，sweep 也会确认并补杀。
+        """
+        survivors = []
+        for r in self._retired:
+            if not r.thread.is_alive():
+                if not self._confirm_or_keep(r):
+                    survivors.append(r)
+                    continue
+                try:
+                    r.join(timeout=0)
+                except Exception:
+                    pass
+                continue
+            r.thread.join(timeout=join_timeout)
+            if r.thread.is_alive():
+                survivors.append(r)
+            elif not self._confirm_or_keep(r):
+                survivors.append(r)
+        self._retired = survivors
+
+    def _confirm_or_keep(self, r: "_Reader") -> bool:
+        """确认退役 reader 进程已退出；确认成功返回 True（调用方可移出追踪）。
+
+        确认失败（_confirm_retired_proc 返回 False：poll 异常 / terminate+kill
+        后仍存活）时**保留记录**并累计重试次数（有界重试）：达到
+        _CONFIRM_KILL_MAX 记录告警并标注 abandoned——记录保留在追踪中但
+        sweep 不再重试，绝不静默丢弃句柄（R3 闭合 R2 复审 P1）。
+        已标注 abandoned 的记录不再尝试确认（直接返回 False 保留追踪）。
+        """
+        if r.abandoned:
+            return False
+        if self._confirm_retired_proc(r):
+            return True
+        if r.kill_attempts >= _CONFIRM_KILL_MAX:
+            r.abandoned = True
+            logger.warning(
+                '退役 reader 进程补杀确认多次失败，标注放弃（保留追踪不再重试）: pid=%s path=%s',
+                getattr(r.proc, 'pid', '?'),
+                self.path,
+            )
+        return False
+
+    @staticmethod
+    def _confirm_retired_proc(r: "_Reader") -> bool:
+        """退役 reader 线程已退出后的兜底确认/补杀（批 6-8b 收尾；R3 闭合）。
+
+        前置条件：调用方已确认 r.thread 不再存活（finally 已完整执行，不会
+        再有并发 Popen 操作）。正常路径进程已被 reader finally 终止
+        （poll()!=None），此处为无操作；仅病态路径（_terminate_proc 或
+        gen.close() 的异常被吞、进程仍存活）触发补杀——与「绝不让超时跳过
+        的 _unblock_proc 留下未确认存活的 ffmpeg」的最终保障对应。
+
+        R3（R2 复审 P1 闭合）：返回明确的退出确认结果——
+        - True：进程已确认退出（或无需处理，proc 为 None），调用方可以安全
+          移出追踪；
+        - False：未能确认退出（poll 异常 / terminate+kill 后仍存活），调用方
+          必须保留记录继续受控追踪（累计 r.kill_attempts，达到上限由调用方
+          告警并标注 abandoned）——绝不静默丢弃句柄。
+        """
+        proc = r.proc
+        if proc is None:
+            return True
+        try:
+            if proc.poll() is not None:
+                return True
+        except Exception:
+            r.kill_attempts += 1
+            return False  # poll 异常：无法确认退出 → 保留追踪重试
+        if not WebMClip._terminate_proc(proc):
+            r.kill_attempts += 1
+            return False  # 杀后仍存活 / 终止异常：保留追踪重试
+        return True
+
+    def _enforce_retired_cap(self) -> None:
+        """退役池超过上限时回收已确认退出者（零等待 join；存活者保留追踪，
+        由模块级管理器持续重试）。绝不做有界 join——stop() 在 GUI 线程，
+        任何 join 等待都会变成用户可感知的卡顿（连点回归教训）。
+
+        弹出记录前做兜底确认（_confirm_retired_proc / _confirm_or_keep）：
+        确认成功才弹出；确认失败（poll 异常 / reader finally 异常被吞后
+        进程仍存活）保留追踪（有界重试，达上限告警标注放弃）——绝不静默
+        丢失句柄。"""
+        while len(self._retired) > _MAX_RETIRED_READERS:
+            oldest = self._retired[0]
+            oldest.thread.join(timeout=0)
+            if oldest.thread.is_alive():
+                return  # 仍存活：保留追踪，池短暂超限（进程已终止，线程随管道 EOF 退出）
+            if not self._confirm_or_keep(oldest):
+                return  # 未确认/已放弃：保留追踪（宁可池短暂超限，不可丢句柄）
+            self._retired.pop(0)
+
+    @staticmethod
+    def _terminate_proc(proc: subprocess.Popen | None,
+                        timeout: float = _PROC_TERMINATE_TIMEOUT) -> bool:
+        """主动终止 ffmpeg 子进程并确认退出（P2；R3 返回确认结果）。
+
+        顺序：terminate() → 有界 wait() → 超时 kill() → 再次 wait()。
+        返回 True=已确认退出（或 None / 已退出进程，无操作）；False=未能
+        确认退出（kill 后仍存活 / poll/terminate/wait 异常）——调用方必须
+        保留句柄供后续有界重试（绝不静默假设 terminate 后进程已退出，也
+        不静默丢句柄）。
+
+        已知局限：只保证单个 Popen 句柄（父进程）的退出，不覆盖其派生的
+        进程树。当前 ffmpeg 为单进程解码器、不派生子进程；若未来引入会
+        派生工作子进程的解码器，需在此升级为进程树终止（Windows job
+        object / 进程组 kill），本实现不负责该场景。
+        """
+        if proc is None:
+            return True
+        try:
+            if proc.poll() is not None:
+                return True
+            proc.terminate()
+            try:
+                proc.wait(timeout=timeout)
+                return True
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                try:
+                    proc.wait(timeout=timeout)
+                    return True
+                except subprocess.TimeoutExpired:
+                    logger.warning(
+                        'ffmpeg 进程 terminate+kill 后仍存活（保留句柄供 sweep 重试）: pid=%s',
+                        getattr(proc, 'pid', '?'),
+                    )
+                    return False
+        except Exception:
+            return False
+
+    def _unblock_proc(self, proc: subprocess.Popen | None) -> None:
+        """GUI 侧对播放 reader Popen 的唯一操作：最小解除阻塞 terminate（批 6-8b）。
+
+        只发 TerminateProcess（Windows 上同步杀进程），不做 wait/kill/关管道
+        ——进程退出的确认与管道清理由 reader 线程 finally 的 _terminate_proc +
+        gen.close() 完成（同一 Popen 的完整生命周期只由 owner 线程操作，杜绝
+        跨线程并发操作同一 Popen 的原生竞态）。正在阻塞读 stdout/解析头部的
+        reader 会因进程终止而立即解除阻塞退出（B7 契约不变）。
+
+        幂等：进程已退出/returncode 已知时 terminate() 直接返回（CPython
+        Windows 实现），重复调用无副作用。获取 _proc_lock 有界等待
+        （_PROC_LOCK_ACQUIRE_TIMEOUT）：超时说明 reader 线程正在 finally
+        收尾（持锁，它自己会 _terminate_proc + gen.close() 杀进程）——此处
+        跳过。**跳过不是无条件安全，但最终保障链是闭合的**：stop() 在调用
+        本方法后把（thread, proc）记录进退役池，孤儿注册表 sweep 的
+        _reap_retired 在 reader 线程退出（finally 完成）后做兜底确认
+        （_confirm_retired_proc：句柄仍存活则补杀）。因此即使 owner 的
+        _terminate_proc / gen.close() 因异常被吞而未杀成，sweep 也会补杀
+        并确认退出——try-acquire 超时绝不会留下无人追踪的存活 ffmpeg，
+        也绝不让 stop() 因锁等待明显变长。
+        """
+        if proc is None:
+            return
+        if not self._proc_lock.acquire(timeout=_PROC_LOCK_ACQUIRE_TIMEOUT):
+            # reader 正在 finally 收尾：它会自行 terminate。跳过不新增登记——
+            # 本 proc 已随 stop() 进入退役池 _Reader 记录，sweep 的
+            # _reap_retired 会在线程退出后兜底确认/补杀（见方法 docstring）。
+            return
+        try:
+            try:
+                if proc.poll() is None:
+                    proc.terminate()
+            except Exception:
+                pass
+        finally:
+            self._proc_lock.release()
+
+    # ------------------------------------------------------------ metadata
+    def _ensure_meta(self, _from_warm: bool = False) -> None:
+        if self._duration > 0 or imageio_ffmpeg is None:
+            return
+        key = str(self.path)
+        try:
+            st = Path(key).stat()
+            cache_key = f"{key}|{st.st_mtime_ns}|{st.st_size}"
+        except OSError:
+            cache_key = key
+        cached = _META_CACHE.get(cache_key)
+        if cached is not None:
+            self._frame_count, self._duration = cached
+            if self._frame_count > 0 and self._duration > 0:
+                self._fps = self._frame_count / self._duration
+                self._frame_count_exact = True  # 源自 count_frames_and_secs
+            return
+        entry = _get_meta_file_cache().get(cache_key)
+        if isinstance(entry, dict) and entry.get('frames') and entry.get('duration'):
+            self._frame_count = int(entry['frames'])
+            self._duration = float(entry['duration'])
+            if self._frame_count > 0 and self._duration > 0:
+                self._fps = self._frame_count / self._duration
+                self._frame_count_exact = True  # 源自 count_frames_and_secs
+            _META_CACHE[cache_key] = (self._frame_count, self._duration)
+            return
+        try:
+            if session_ending():
+                return  # 会话结束：不跑 count_frames_and_secs 探测（保留默认值，不告警）
+            if not _from_warm and threading.current_thread() is threading.main_thread():
+                # GUI 线程绝不跑 ffprobe 子进程（实测定案：冷 meta 在 GUI 探测 =
+                # 使用中 100-250ms 成簇卡顿的元凶，冻结现场采样抓到现行）。
+                # 踢给后台预热（每 clip 只踢一次），本次先吃默认值——reader
+                # 会从码流 meta 补充；热身后下次 start 即中缓存。显式预热
+                # （warm_meta，含测试在主线程显式调用）不受此闸限制。
+                if not getattr(self, '_meta_bg_kicked', False):
+                    self._meta_bg_kicked = True
+                    threading.Thread(target=self._warm_meta_quiet,
+                                     daemon=True, name='pet-warm-meta').start()
+                return
+            frames, secs = imageio_ffmpeg.count_frames_and_secs(key)
+            if frames and frames > 0:
+                self._frame_count = int(frames)
+            if secs and secs > 0:
+                self._duration = float(secs)
+            if self._frame_count > 0 and self._duration > 0:
+                self._fps = self._frame_count / self._duration
+                self._frame_count_exact = True
+            _META_CACHE[cache_key] = (self._frame_count, self._duration)
+            _save_meta_file_cache_entry(cache_key, self._frame_count, self._duration)
+        except Exception as exc:
+            logger.warning('webm 元数据读取失败 %s: %s', self.path, exc)
+            # 保留默认值，后续 reader 会尝试从 read_frames 的 meta 补充
+
+    def warm_meta(self) -> None:
+        """预取元数据（可被线程池并行调用；测试在主线程显式调用也允许探测）。"""
+        self._ensure_meta(_from_warm=True)
+
+    def _warm_meta_quiet(self) -> None:
+        try:
+            self.warm_meta()
+        except Exception:
+            pass  # 后台预热失败不致命：reader 会从码流 meta 补充
+
+    def _timer_interval(self) -> int:
+        base = (
+            max(1, int(round(1000 / (self._fps * self.playback_speed))))
+            if self._fps > 0
+            else max(1, int(round(catalog.FRAME_MS / self.playback_speed)))
+        )
+        # 解码节流（批11）：interval ×ratio —— 消费端降速为
+        # fps/ratio，配合 reader 的阻塞入队（背压）让 ffmpeg 解码速率
+        # 联动下降到同一节奏。ratio=1（默认/非闲置）时与旧行为逐位一致。
+        return max(1, base * self._decode_throttle_divisor)
+
+    def frameCount(self) -> int:
+        if self._frame_count <= 0:
+            self._ensure_meta()
+        return max(1, self._frame_count)
+
+    def duration(self) -> float:
+        if self._duration <= 0:
+            self._ensure_meta()
+        return self._duration / self.playback_speed if self._duration > 0 else 0.0
+
+    def currentFrameNumber(self) -> int:
+        # 显示帧索引 = 素材源时间线 0-based 帧号（P1 复审）：降帧相位与
+        # 末帧判断、预缩放缓存的帧号 key 都以此为准，与消费计数无关。
+        return self._current_frame_index
+
+    def currentTimeSeconds(self) -> float:
+        if self._fps <= 0:
+            return 0.0
+        return self._current_frame_index / (self._fps * self.playback_speed)
+
+    def currentPixmap(self):
+        return self._current_pixmap
+
+    def currentImage(self):
+        """零拷贝显示帧通道：直返 _current_image（与 currentPixmap 同一帧）。
+
+        显示语义与 currentPixmap() 一致（同一帧、同一次提交），只是省掉调用方
+        的 QPixmap→QImage 全画布往返。线程安全：_current_image 的读写都在 GUI
+        线程（_process_frame/jumpToFrame 与窗口重建同线程），
+        故不加锁；调用方也不得跨线程读取或改写返回值。
+        """
+        return self._current_image
+
+    def clear_display_frame(self) -> None:
+        """清空当前显示槽（A1：非显示 clip 释放 _current_image/_current_pixmap）。
+
+        **只在 GUI 线程调用**（窗口 `_switch` 切走旧 clip 时）。约 1.84MB/段的
+        原生位图随清空交给 Qt 回收，堵住「每个播过的 clip 永久持有最后一帧」
+        的慢涨（A1）。软停驻留（park）绝不清：park 的 clip 可能仍是当前显示
+        对象且可能被 re-arm 续圈——park 在 stop() 早退、不经 _hard_stop，
+        本方法不受影响。清空后 currentPixmap() 为 None，调用方（非当前显示
+        对象）已有 None 兜底（window._rebuild_frame 空图跳过）。
+        """
+        self._current_image = None
+        self._current_pixmap = None
+
+    # ------------------------------------------------------------ lifecycle
+    def _apply_interval(self, interval: int) -> None:
+        """落地消费节拍间隔：同值不重设，运行中把新值排到下一次 timeout。
+
+        对运行中的 QTimer 重设 interval（``setInterval`` / ``start(ms)`` 同语义）
+        会**重开倒计时**：当拍已经走掉的时间被抹掉，下一帧被推迟最多一个整间隔。
+        飞行期 ``set_flight_anim_speed`` 每 ~4 个 tick（≈64ms）就写一次速率、每次
+        写入都跨过一个间隔档，于是帧交付被反复推迟（实机"上下飞帧数上不去"，
+        I1 真 QTimer 探针：每 64ms 写一次同值 → 2s 只交付 31 帧 vs 不写 47 帧）。
+
+        规则：目标间隔与当前一致 → 什么都不做（连 QTimer 都不碰）；真变了且帧表
+        正在运行 → 记在 ``_pending_interval``，由下一次 timeout（``_poll`` 入口）
+        落地——那一刻倒计时本来就要重开，零额外代价。帧表未运行时立即落地：
+        ``_switch()`` 在 ``movie.start()`` 之前设速率的老语义不变（否则新动画会
+        继续用默认 1x 间隔起播）。
+        """
+        interval = max(1, int(interval))
+        if interval == self._timer.interval():
+            self._pending_interval = None  # 目标已生效，撤掉排队的值
+            return
+        if self._timer.isActive():
+            self._pending_interval = interval
+            return
+        self._pending_interval = None
+        self._timer.setInterval(interval)
+
+    def _flush_pending_interval(self) -> None:
+        """把排队的间隔落地（由帧表 timeout 入口调用：倒计时刚重开，零代价）。"""
+        pending = self._pending_interval
+        if pending is None:
+            return
+        self._pending_interval = None
+        if pending != self._timer.interval():
+            self._timer.setInterval(pending)
+
+    def _set_interval_now(self, interval: int) -> None:
+        """立即落地间隔（帧表未运行 / 即将 start 的路径：没有倒计时要保）。"""
+        self._pending_interval = None
+        self._timer.setInterval(max(1, int(interval)))
+
+    def set_playback_speed(self, speed: float) -> None:
+        self.playback_speed = max(0.1, float(speed))
+        # _switch() 在 movie.start() 之前设置速率 → 未运行时必须立即落地，
+        # 否则每个新 WebM 动画都会继续使用默认的 1x interval。
+        self._apply_interval(self._timer_interval())
+
+    @property
+    def decode_throttle_divisor(self) -> int:
+        """当前解码节流比率（1 = 不节流）。窗口层读取以协调发布语义。"""
+        return self._decode_throttle_divisor
+
+    @property
+    def decode_pace_external(self) -> bool:
+        """解码 pace 是否由共享 hub 接管（批5.3）。置位后窗口层不直接推 divider。"""
+        return self._decode_pace_external
+
+    def set_decode_pace_external(self, value: bool) -> None:
+        """置/清共享 hub 外部 pace（批5.3；hub GUI 线程调用）。"""
+        self._decode_pace_external = bool(value)
+
+    def set_decode_throttle(self, divisor: int) -> None:
+        """设置解码节流比率（闲置降帧联动，批11；主线程调用）。
+
+        预留接口：比率可配，默认由窗口层按闲置降帧除数（IDLE_LOW_FPS_
+        DIVISOR = 2）推送，不硬编码。>1 时：
+        - 消费端：QTimer interval ×divisor（呈现节奏 = 原始 fps/divisor）；
+        - 解码端：reader 入队改阻塞（背压），ffmpeg 解码速率随消费端联动
+          下降（队列写满 → ffmpeg 阻塞在 write()）。
+        ratio=1 恢复全速——非闲置路径调用此方法为幂等 no-op，行为零变化。
+        幂等：比率未变时不做任何事（窗口层每帧同步调用，成本仅一次 int 比较）。
+        """
+        divisor = max(1, int(divisor))
+        if divisor == self._decode_throttle_divisor:
+            return
+        self._decode_throttle_divisor = divisor
+        self._apply_interval(self._timer_interval())
+
+    def set_recycle_minutes(self, minutes: int) -> None:
+        """设置 ffmpeg 圈边界定期回收阈值（分钟；0 = 关闭回收。批11-B1，主线程调用）。
+
+        窗口层在播放动画前推送 config 的 ``ffmpeg_recycle_minutes``（默认 10）。
+        只影响圈边界回收判定（_loop_boundary 的 _recycle_due）：到达阈值的一圈
+        结束时不做 park/re-arm、reader 正常退出杀进程，下一次 start() 自然
+        fresh spawn。不改变任何播放/驻留/续圈/退役语义。正值夹到 [2, 120] 分钟；
+        0 / 非法输入视为关闭（回退保险，现状逐位一致）。
+        """
+        try:
+            minutes = float(minutes)
+        except (TypeError, ValueError):
+            minutes = 0.0
+        if minutes <= 0:
+            self._recycle_seconds = 0.0
+        else:
+            self._recycle_seconds = max(2.0, min(120.0, minutes)) * 60.0
+
+    def _recycle_due(self) -> bool:
+        """圈边界回收判定（reader 线程）：当前 ffmpeg 进程存活已达回收阈值。
+
+        只在圈边界（_loop_boundary，结束标记已交付、无 pending re-arm）调用。
+        0（关闭，_recycle_seconds <= 0）恒为 False；进程出生时刻未记录
+        （_reader_born_at <= 0，feed 路径/异常）也判 False（防御）。
+        读 _recycle_seconds 用 GIL 原子性，与 _decode_throttle_divisor 同模式。
+        """
+        if self._recycle_seconds <= 0:
+            return False
+        if self._reader_born_at <= 0:
+            return False
+        return (time.monotonic() - self._reader_born_at) >= self._recycle_seconds
+
+    def start(self) -> bool:
+        """启动播放；返回 True 表示已启动（或已在播），False 表示本次启动被拒绝。
+
+        拒绝原因：imageio_ffmpeg 不可用、clip 已 cleanup（终结）。
+
+        调用方（窗口层）必须把 False 当作「动画没有在播」并执行明确降级
+        （回退上一动画/待机、安排重试），绝不能把动画状态切换与播放启动
+        当成同一件事（B7 审查 P1-1）。
+        """
+        if self._running:
+            return True
+        if self._cleaned:
+            logger.warning('clip 已 cleanup，拒绝启动 reader: %s', self.path)
+            return False
+        if imageio_ffmpeg is None:
+            self.errorOccurred.emit(str(_IMPORT_ERROR or 'imageio_ffmpeg 不可用'))
+            return False
+        if session_ending():
+            # 会话结束（关机/注销）：绝不再拉起新的取帧进程（issue #111）。
+            # 沿用既有「启动被拒」契约 —— 调用方按 False 走降级/重试。
+            logger.info('会话结束中，拒绝启动 reader: %s', self.path)
+            return False
+
+        # 批8 续圈：圈边界软停（_soft_parked）且循环 reader 仍存活 → re-arm
+        # 直接续播下一圈，不重启 reader/ffmpeg（消灭每圈进程 churn）。
+        # re-arm 失败（reader 已退出/异常）则落回正常启动路径。
+        # 复审 P1-2（批5.3）：本 clip 已被登记为订阅者（_feed_source 已置）时
+        # 绝不可以 re-arm——驻留的旧 reader 在 _reader_local 里只会继续本地
+        # 解码，绕过 feed 分派 = 静默双 ffmpeg。必须落 fresh start 进 feed。
+        if self._soft_parked and self._feed_source is None and self._rearm_loop_reader():
+            return True
+
+        # 上一轮 natural end 残留的 active 线程先退役（其 ffmpeg 已自行退出）
+        with self._reader_lock:
+            stale_thread = self._thread
+            stale_proc = self._reader_proc
+            self._thread = None
+            self._reader_proc = None
+        if stale_thread is not None:
+            self._retired.append(_Reader(thread=stale_thread, proc=stale_proc))
+        # 退役池回收只做零等待（丢弃已退出者）；存活者已在 stop() 时 terminate，
+        # 其线程由管道 EOF 驱动退出、模块级管理器持续追踪。
+        # 绝不在这里 join 等待：join 会阻塞 GUI 线程，连点/快速切换动画时
+        # 每次都卡最多 0.5s（实测回归）。病态卡死的极端累积由日志可观测。
+        self._reap_retired(join_timeout=0)
+        if len(self._retired) > _MAX_RETIRED_READERS * 4:
+            logger.warning(
+                'webm reader 退役池异常累积（%d 个存活）：%s',
+                len(self._retired), self.path,
+            )
+
+        # 在 GUI 线程读取真实 fps 后再启动 QTimer，保证新动画的实际帧率
+        # 与播放速率计算一致；reader 线程只负责解码和入队。
+        self._ensure_meta()
+        self._set_interval_now(self._timer_interval())
+        stop_evt = threading.Event()
+        ready_evt = threading.Event()
+        self._stop_evt = stop_evt
+        self._reader_ready = ready_evt
+        self._queue = queue.Queue(maxsize=8)
+        self._frame_index = 0
+        self._current_frame_index = 0  # 新一轮播放从头计时（P1 复审）
+        self._ended_fired = False
+        self._soft_parked = False
+        self._natural_end_pending = False
+        self._rearm_pending = False
+        self._boundary_marker_pending = False
+        self._reader_parked = False
+        # P1-1：硬停置位过的 _loop_gate 在此清零——否则新 reader 的首个
+        # 圈边界会被残留 gate 直通而跳过驻留（软停自此永久失效、churn 照旧）。
+        self._loop_gate.clear()
+        self._loop_ack.clear()
+        self._generation += 1
+        gen_id = self._generation
+
+        thread = threading.Thread(
+            target=self._reader,
+            args=(stop_evt, gen_id, ready_evt),
+            daemon=True,
+            name=f'webm-reader-{gen_id}',
+        )
+        with self._reader_lock:
+            self._thread = thread
+        if mem_debug.ENABLED:
+            # 取证：把本代 reader 的帧队列（本代真正被 reader 持有的那个）登记
+            # 进排查表——换代后旧队列仍被旧 reader 引用，只有按 reader 登记才
+            # 能看到「某代退役但队列未释放」。weakref，不影响生命周期。
+            mem_debug.note_reader(
+                f'{os.path.basename(str(self.path))}#{gen_id}',
+                self._queue, thread, self._w * self._h * self._bpp,
+            )
+        # 缺陷 19：_running 只在 reader 与播放节拍都真的起来之后才置位。修前它
+        # 早于 thread.start()/_timer.start()，任一步抛错都留下「_running=True 却
+        # 没有 reader/定时器」的 clip，此后每次 start() 都在开头假成功（冻在旧帧）。
+        try:
+            thread.start()
+        except BaseException:
+            # 线程根本没起来（资源不足等）：撤回登记，绝不留「有 _thread 却无 reader」
+            with self._reader_lock:
+                if self._thread is thread:
+                    self._thread = None
+            raise
+        try:
+            if not self._paused:
+                self._timer.start()
+        except BaseException:
+            # 定时器起不来（C++ 侧半销毁）时 reader 已经活着，且真实路径里它
+            # 还会拉起 ffmpeg——绝不能让线程与进程无人消费地留着。走既有硬停
+            # 收口（置停止信号 + 解除阻塞 + terminate + 退役登记 + 孤儿追踪），
+            # _running 保持假，异常照抛给调用方（下次 start() 仍可重试）。
+            self._hard_stop()
+            raise
+        self._running = True
+        return True
+
+    def pause(self) -> None:
+        """暂停播放节拍（O3：隐藏/挂起期不再按帧率消费）。
+
+        只停消费端 QTimer：播放位置（``_frame_index``/``_current_frame_index``）、
+        帧队列、当前显示图全部原地保留——恢复走 ``resume()`` 从暂停处续播，
+        **不**重启 reader、**不**回第 0 帧（``stop()``/``jumpToFrame(0)`` 都会
+        换代并重新拉起 ffmpeg，冷启动 60-166ms，绝不能拿来当暂停用）。
+
+        reader 侧走**背压**：``_paused`` 让取帧路径转成阻塞入队（见
+        ``_stamp_source_indices``/``_reader_feed`` 的节流分支），队列写满即
+        reader 停步 → ffmpeg 管道写满自然停解码。改前只有消费端停摆、reader
+        仍走丢帧路径（队列满即丢、源帧号照推）：暂停 = 持续解码 + 持续丢帧，
+        暂停位置丢穿、隐藏期 CPU 白烧。恢复无需重新起进程 = 无首帧冷启动。
+        """
+        if self._paused:
+            return
+        self._paused = True
+        try:
+            self._timer.stop()
+        except RuntimeError:
+            pass  # C++ QTimer 已随 clip 销毁（半销毁场景）
+
+    def resume(self) -> None:
+        """恢复播放节拍（从暂停处续播）。已停播（``_running=False``）时只清标记。"""
+        if not self._paused:
+            return
+        self._paused = False
+        if not self._running:
+            return
+        try:
+            self._set_interval_now(self._timer_interval())
+            self._timer.start()
+        except RuntimeError:
+            logger.debug('webm 恢复播放节拍失败（QTimer 已销毁）: %s', self.path)
+
+    def stop(self) -> None:
+        self._running = False
+        # 批8 圈边界软停：进程内循环的 reader 已到圈末（末帧/结束标记已交付，
+        # _natural_end_pending）且仍存活——保留 ffmpeg 进程驻留等续圈
+        # （start() re-arm），不再每圈杀进程重启。reader 驻留期间由背压
+        # 阻塞出帧（近零 CPU）；宽限期（_LOOP_REARM_GRACE_SECS）满未续圈则
+        # reader 自行退出杀进程——切走/被打断的 clip 不泄漏常驻进程。
+        # 中途打断/主动关停/清理仍走硬停（_hard_stop，原路径逐位保留）。
+        if self._park_loop_reader_if_natural_end():
+            return
+        self._hard_stop()
+
+    def _park_loop_reader_if_natural_end(self) -> bool:
+        """圈末自然结束的软停：停消费节拍、保留循环 reader 与 ffmpeg 进程。
+
+        返回 True = 已软停驻留（等 start() re-arm 续圈）；False = 不适用
+        （非圈末/reader 未驻留在循环边界/reader 已退出），调用方走硬停。
+        只对确认驻留在圈边界（_reader_parked）的本地循环 reader 软停：
+        feed 路径与正在 finally 退出的 reader 绝不软停（它们的线程随即
+        退出，软停会让 start() 误以为可续圈）。
+        """
+        if not self._natural_end_pending:
+            return False
+        if not self._reader_parked:
+            return False
+        thread = self._thread
+        if thread is None or not thread.is_alive():
+            return False
+        self._soft_parked = True
+        try:
+            self._timer.stop()
+        except RuntimeError:
+            pass  # C++ QTimer 已随 clip 销毁（半销毁场景）
+        return True
+
+    def _hard_stop(self) -> None:
+        """硬停（原 stop() 路径）：置停止信号 + 解除阻塞读 + terminate ffmpeg。"""
+        self._running = False
+        self._soft_parked = False
+        self._natural_end_pending = False
+        self._rearm_pending = False
+        self._boundary_marker_pending = False
+        self._reader_parked = False
+        # 停止信号先于任何 Qt 交互送达（Fix B）：C++ 半销毁（QTimer 已随 clip
+        # 销毁）场景下，reader 也必须收到停止信号、ffmpeg 必被 terminate、
+        # 线程必被退役登记——_timer.stop() 移到最末并吞 RuntimeError，保证
+        # 前置步骤永不因 Qt 缺失中止（否则又是同款僵尸）。
+        stop_evt = self._stop_evt
+        if stop_evt is not None:
+            stop_evt.set()
+        # 唤醒圈边界驻留的 reader（批8），让它立刻看到停止信号退出。
+        self._loop_gate.set()
+        # 主动 terminate 底层 ffmpeg：不能只是 set 事件等 reader 自己退（B7）。
+        # 正在阻塞读管道/解析头部的 reader 会因进程终止而立即解除阻塞退出。
+        # 批 6-8b：这里只做「最小解除阻塞 terminate」（_unblock_proc）——所有权
+        # 在 reader 线程（唯一执行 wait/kill/关管道的线程），GUI 侧绝不再并发
+        # 操作同一 Popen（Windows 原生竞态崩溃根因）；进程退出的确认由 reader
+        # finally 完成，stop() 本身零等待返回。
+        thread = None
+        proc = None
+        with self._reader_lock:
+            thread = self._thread
+            proc = self._reader_proc
+            self._thread = None
+            self._reader_proc = None
+        if proc is not None:
+            self._unblock_proc(proc)
+        if thread is not None:
+            self._retired.append(_Reader(thread=thread, proc=proc))
+            self._enforce_retired_cap()
+            # 退役池回收交给模块级生命周期管理器（P2）：持有 clip 直到退役
+            # reader 全部退出，既避免 GC 与 reader 收尾竞态，也保证 cleanup
+            # 后不残留本 clip 的 timer 调度。
+            if not self._cleaned and self._retired:
+                _register_orphan(self)
+        try:
+            self._timer.stop()
+        except RuntimeError:
+            pass  # C++ QTimer 已随 clip 销毁（半销毁场景）：停止信号与进程终止已先行完成
+        # A1：硬停 = clip 不再被显示（切走旧 clip / 隐藏 / 关闭 / cleanup），
+        # 清空显示槽释放 ~1.84MB 原生位图。_switch 对新 clip 的
+        # stop→jumpToFrame→start 链会由 jumpToFrame 重写显示槽，清空无害；
+        # 软停驻留（park）在 stop() 早退、不到这里，显示槽保留。
+        self.clear_display_frame()
+
+    def _rearm_loop_reader(self) -> bool:
+        """圈边界续圈（批8）：软停驻留的循环 reader 直接续播下一圈，不重启
+        reader/ffmpeg。返回 False = reader 已退出/不可用，调用方走正常
+        start() 重新拉起。必须在 GUI 线程调用（QTimer 操作）。
+
+        「结束标记至多交付一次」由 _loop_lock 保证：reader 在锁内检查
+        _rearm_pending 决定跳过/发出结束标记，re-arm 在锁内置位并排空腹
+        中的标记——两案互斥，绝不重复上报一圈结束。
+        唤醒握手（P1-2）：reader 醒来续圈后在锁内置 _loop_ack；re-arm
+        有界等待 ack——is_alive() 在 reader 的 finally 收尾窗口内仍为
+        True（TOCTOU），等不到 ack 说明 reader 实际已在退出，回滚本次
+        re-arm 落回 fresh start，绝不让 start() 返回 True 却无 reader 存活。
+        """
+        thread = self._thread
+        if thread is None or not thread.is_alive():
+            return False
+        self._loop_ack.clear()  # 握手归零（先于置位 gate；等待在锁外）
+        with self._loop_lock:
+            if self._boundary_marker_pending:
+                # 结束标记已发出（本圈结束已上报）：无论它已被 _poll 消费
+                # 还是仍在队列里，排空残留即可——绝不能置 _rearm_pending，
+                # 否则下一圈边界会误跳过结束标记（动画链停一圈）。
+                self._drain_boundary_marker()
+                self._boundary_marker_pending = False
+                self._rearm_pending = False
+            else:
+                # 不变量（P3-8）：软停 ⇒ reader 已驻留 ⇒ 结束标记已发出
+                # （_reader_parked 只在标记投递后由 reader 置位），本分支
+                # 理论上不可达。防御性按「标记未发」处理并留告警——若真
+                # 到达，说明软停/驻留/标记的不变量被新改动破坏。
+                logger.warning('webm 续圈时结束标记未发出（不变量破坏）: %s', self.path)
+                self._rearm_pending = True
+            self._soft_parked = False
+            self._natural_end_pending = False
+            self._frame_index = 0
+            self._current_frame_index = 0  # 新一圈从源时间线 0 起
+            self._ended_fired = False
+            self._running = True
+            self._set_interval_now(self._timer_interval())
+            self._loop_gate.set()  # 唤醒圈边界驻留的 reader
+        if not self._paused:
+            self._timer.start()
+        if not self._loop_ack.wait(_LOOP_REARM_ACK_TIMEOUT):
+            # 唤醒握手超时：reader 实际已在退出（finally 窗口），回滚 re-arm
+            # 落回 fresh start（调用方正常路径会换代/换队列/重新拉起）。
+            self._timer.stop()
+            self._running = False
+            return False
+        return True
+
+    def _drain_boundary_marker(self) -> None:
+        """re-arm 时排空队列中本圈圈末的结束标记。
+
+        队列是 FIFO：上层消费到末帧后队列里只剩边界 None（reader 驻留于
+        边界、还没产下一圈帧）；末帧被丢弃的兜底路径则 None 已被 _poll
+        消费、队列为空或已是下一圈帧。只读到首个 None 为止（不含其后的
+        下一圈帧）；只丢弃 None 本身——其前的帧（理论不可达，防御）原样
+        按序放回，绝不静默丢已交付帧（P3-7）。
+        """
+        q = self._queue
+        items = []
+        while True:
+            try:
+                items.append(q.get_nowait())
+            except queue.Empty:
+                break
+        # 只去掉本圈圈末的结束标记（至多一个），其余帧原序放回——
+        # 绝不静默丢已交付帧（P3-7）。
+        if None in items:
+            items.remove(None)
+        for item in items:
+            try:
+                q.put_nowait(item)
+            except queue.Full:
+                break
+
+    def jumpToFrame(self, frame_index: int) -> bool:
+        # 本项目只需要回到首帧；完整 seek 通过重启 reader + 丢弃帧实现。
+        if frame_index <= 0:
+            self.stop()
+            self._frame_index = 0
+            self._current_frame_index = 0  # 回到首帧 = 源时间线 0（P1 复审）
+            if self._first_image is not None:
+                # 首帧已缓存（后台 warm_first_frame 或上次同步解码）：
+                # 主线程直接转 QPixmap，零阻塞、无旧帧残留窗口。
+                self._current_image = self._first_image
+                self._current_pixmap = QPixmap.fromImage(self._first_image)
+                _ffr_evict(_ffr_touch(self))  # LRU 置顶 + 执行被逐出项（不丢弃）
+            else:
+                self._current_image = None
+                self._current_pixmap = None
+                # GUI 线程永不同步解码首帧（实测定案：冷路径 100-337ms 冻结）。
+                # 此处不 kick 任何解码：窗口在播放首帧到达前继续显示旧帧
+                # （_rebuild_frame 对空 pixmap 跳过，旧帧天然顶着）；播放路径
+                # 的 reader 会在后台解码交付，源帧 0 由 _process_frame 顺手写进
+                # 首帧缓存（播过留热），冷启动/切换全程无 GUI 阻塞。
+                # （曾短暂改为 kick 后台 warm 线程——套件内大量并发后台解码
+                # 导致全量测试 access violation，已移除；预热职责仍归 library
+                # 既有调度器与 warm 闸门。）
+            return True
+        return False
+
+    def _decode_first_qimage(self, gen: int | None = None):
+        """解码首帧为 QImage（线程安全：不触碰 QPixmap/QTimer）。
+
+        返回 None 表示失败、依赖缺失，或解码期间已被取消（换代）；调用方
+        负责经 _store_first_frame（持锁提交）写入 _first_image 缓存。
+
+        P1-2 生命周期：解码拉起的 ffmpeg 进程经 _PopenCapture 登记到
+        _first_frame_procs（_reader_lock 保护），cancel_first_frame_warm/
+        cleanup 可主动 terminate；gen 是本次解码认领的首帧代次，解码期间
+        代次被换代则结果作废返回 None。未显式传入 gen 时以解码开始时的
+        代次为准（所有真实调用路径均显式传入，此为防御默认）。
+
+        跨库共享（同角色多宠）：同进程内已有库解过这段素材的首帧时直接
+        取用（同一 QImage 对象），不 spawn、不解码——详见模块顶部"首帧解码
+        结果跨库共享"。这是首帧解码的唯一入口，预热与同步播放路径都在此收口。
+        """
+        if imageio_ffmpeg is None:
+            return None
+        if session_ending():
+            return None  # 会话结束：绝不为首帧拉起解码进程（走既有 None 降级）
+        shared = shared_first_frame(self.path)
+        if shared is not None:
+            return shared  # 命中兄弟库已解出的首帧：0 spawn、0 解码
+        bump_first_frame_spawns()
+        # 批 6-8b：探测串行化预热——与播放 reader 同源，避免首帧解码路径
+        # 并发跑 ffmpeg -version 探测（read_frames 内部本就会探测，此处仅
+        # 提前到统一入口并串行化）。
+        _ensure_ffmpeg_exe()
+        if gen is None:
+            gen = self._first_frame_gen
+        proc = None
+        g = None
+        try:
+            def _register(p: subprocess.Popen, argv) -> None:
+                """解码进程 Popen 一拉起即登记（可被取消/cleanup 主动 terminate）。
+
+                登记在 _reader_lock 内复查代次与 cleanup 状态（B7 复审 R2）：
+                取消（cancel_first_frame_warm 换代/清集合）与登记之间存在
+                竞态窗口——「Popen 已创建、登记尚未完成」时取消会读到空集合；
+                迟到的登记必须自检 stale，已取消的进程绝不漏进集合，而是
+                立即自终止，保证取消后不再有不受控的 ffmpeg 存活。
+                """
+                nonlocal proc
+                if not (isinstance(argv, list) and "-i" in argv):
+                    return  # ffmpeg exe 探测等非解码进程：忽略
+                proc = p
+                with self._reader_lock:
+                    stale = self._cleaned or gen != self._first_frame_gen
+                    if not stale:
+                        self._first_frame_procs.add(p)
+                if stale:
+                    self._terminate_proc(p)
+
+            if perfstats.ENABLED:
+                _ff_t0 = perfstats.clock()
+            if session_ending():
+                # 会话结束（issue #111）：门禁之后、Popen 之前再复查一次，
+                # 收紧并发关机窗口；proc 仍为 None，finally 无句柄可收。
+                return None
+            with _PopenCapture(on_process=_register):
+                g = imageio_ffmpeg.read_frames(
+                    str(self.path),
+                    pix_fmt='rgba',
+                    bits_per_pixel=self._bpp * 8,
+                    input_params=list(_FFMPEG_INPUT_PARAMS),
+                )
+                meta = next(g)  # ffmpeg 进程在此拉起；capture 即时登记句柄
+                frame = next(g)
+            if perfstats.ENABLED:
+                # 首帧解码核心段（ffmpeg 拉起 + 两帧交付）：同步路径的
+                # 点击卡顿与后台预热的耗时都在这里（P0 观测）。
+                perfstats.time('webm.first_frame', perfstats.clock() - _ff_t0)
+            if gen is not None and gen != self._first_frame_gen:
+                return None  # 解码期间被取消/换代：结果作废
+            if meta.get('fps'):
+                self._fps = float(meta['fps'])
+            if meta.get('duration'):
+                self._duration = float(meta['duration'])
+            if self._frame_count <= 0 and self._fps > 0 and self._duration > 0:
+                self._frame_count = int(round(self._fps * self._duration))
+            expect = self._w * self._h * self._bpp
+            if len(frame) != expect:
+                # 尺寸不符是"素材与画布不同步"的第一现场，静默 return None 会让
+                # 它完全不可诊断（对齐播放侧 _process_frame 的同款 warning，#201）。
+                logger.warning('webm 首帧长度异常 %s: got=%d expect=%d',
+                               self.path, len(frame), expect)
+                return None
+            img = QImage(frame, self._w, self._h, self._w * self._bpp,
+                         QImage.Format.Format_RGBA8888)
+            if img.isNull():
+                logger.warning('webm 首帧图像为空 %s: %dx%d',
+                               self.path, self._w, self._h)
+                return None
+            return img.copy()
+        except Exception as exc:
+            logger.warning('webm 首帧解码失败 %s: %s', self.path, exc)
+            return None
+        finally:
+            if proc is not None:
+                if mem_debug.ENABLED:
+                    mem_debug.bump('ff_done')  # 取证：已收尾的解码进程数
+                with self._reader_lock:
+                    self._first_frame_procs.discard(proc)
+            if g is not None:
+                try:
+                    # 批 6-8b：g.close()（内部 poll/关管道/等待/kill）与 GUI
+                    # cancel_first_frame_warm 的 _terminate_proc 以 _ff_proc_lock
+                    # 互斥——同一 Popen 的操作任意时刻只允许一个线程执行。
+                    with self._ff_proc_lock:
+                        g.close()
+                except Exception:
+                    pass
+
+    def _store_first_frame(self, img) -> list:
+        """把解码结果写入 _first_image 缓存（调用方须已持有 _first_frame_lock）。
+
+        幂等：缓存已存在则跳过；写入后 set _first_frame_done。
+        返回待逐出列表——调用方必须在释放本 clip 锁后再 _ffr_evict
+        （R3 复审：锁内逐出会取 victim 的锁，构成跨对象持锁嵌套）。
+
+        同时把结果发布进**跨库共享表**（同角色兄弟库直接取用，不再各解一遍；
+        见模块顶部"首帧解码结果跨库共享"）。锁序与 _ffr_touch 一致：clip 首帧锁
+        → 共享表锁（单向，无反向获取）。
+        """
+        if img is None:
+            return []
+        if self._first_image is None:
+            self._first_image = img
+            self._first_frame_done.set()
+            share_first_frame(self.path, img)
+            # 预算 LRU 登记；逐出返回给调用方、在释放本 clip 锁后执行
+            # （R3 复审：持锁期间逐出会取 victim 的锁，跨对象嵌套可死锁）
+            return _ffr_touch(self, img.width() * img.height() * 4)
+        return []
+
+    def _decode_first_qimage_and_cache(self, gen: int | None = None) -> list:
+        """解码首帧并写入 _first_image 缓存（调用方须已持有 _first_frame_lock）。
+
+        幂等：缓存已存在时直接返回，避免重复拉起 ffmpeg。
+        gen：warm 传入的首帧代次；解码期间被换代（cancel_first_frame_warm/
+        cleanup）则丢弃结果，不污染缓存（P1-2）。
+        """
+        if self._first_image is not None:
+            return []
+        img = self._decode_first_qimage(gen=gen)
+        if gen is not None and gen != self._first_frame_gen:
+            return []  # 已被取消/换代：结果作废，不提交
+        return self._store_first_frame(img)
+
+    def warm_first_frame(self) -> None:
+        """后台线程预解码首帧缓存（仅 QImage，线程安全）。
+
+        首次播放某动画时 jumpToFrame(0) 需要首帧：有缓存则主线程零阻塞，
+        避免点击瞬间同步 ffmpeg 解码造成卡顿，以及 Q 弹期间残留旧动画帧。
+
+        原子认领（N4）：同一时间只有一个首帧解码执行者。认领失败（前台
+        同步解码或并发预热正在进行）直接放弃——预热是尽力而为，不排队等待。
+
+        P1-2：预热解码纳入生命周期回收——解码拉起的 ffmpeg 登记到
+        _first_frame_procs，cancel_first_frame_warm/cleanup 可主动 terminate；
+        解码代次在认领时捕获，取消后结果作废不写入缓存。cleanup 后不再预热。
+        """
+        if self._first_image is not None or imageio_ffmpeg is None or self._cleaned:
+            return
+        if not self._first_frame_lock.acquire(blocking=False):
+            return
+        victims = []
+        try:
+            gen = self._first_frame_gen
+            victims = self._decode_first_qimage_and_cache(gen=gen)
+        finally:
+            self._first_frame_lock.release()
+        _ffr_evict(victims)  # 锁外逐出（同上）
+
+    def cancel_first_frame_warm(self) -> None:
+        """取消在飞的首帧预热（P1-2）：换代使在飞解码结果作废，并主动
+        terminate 其 ffmpeg 进程。
+
+        由 cleanup()（clip 销毁）与 MovieLibrary.pause_warm()（隐藏/切角色）
+        调用。之后新的 warm_first_frame 仍可重新预热（代次自增，非终态）。
+
+        换代与集合读取/清空在 _reader_lock 内原子完成（B7 复审 R2）：登记
+        回调也在该锁内复查代次——「Popen 已创建、登记尚未完成」窗口内取消
+        时，迟到的登记会看到换代并自终止，已取消进程绝不漏进集合。
+        """
+        with self._reader_lock:
+            self._first_frame_gen += 1
+            procs = list(self._first_frame_procs)
+            self._first_frame_procs.clear()
+        for p in procs:
+            # 批 6-8b：完整 terminate（terminate→wait→kill→wait，测试锁定的取消
+            # 语义：进程必须确认退出）在 _ff_proc_lock 内执行——与解码线程
+            # finally 的 g.close()（同锁）互斥，杜绝 GUI 与解码线程并发操作
+            # 同一 Popen。有界等待：超时说明解码线程正在收尾，其 g.close() 内部
+            # 会 kill 存活进程（imageio finally：poll 判活 → 关管道 → kill），
+            # 且结果已因换代作废。两条「没确认退出」的路径都不是无条件安全
+            # （g.close 异常被吞 / kill 后仍存活）——统一登记到 _unconfirmed_procs，
+            # 由孤儿注册表 sweep 在 owner 释放锁后确认/补杀
+            # （_sweep_unconfirmed_procs）。
+            if self._ff_proc_lock.acquire(timeout=_PROC_LOCK_ACQUIRE_TIMEOUT):
+                try:
+                    confirmed = self._terminate_proc(p)
+                finally:
+                    self._ff_proc_lock.release()
+                if not confirmed:
+                    # 缺陷 20：拿到锁 != 确认退出。_terminate_proc 返回 False
+                    # （poll/terminate 异常或 kill 后仍存活）时句柄同样必须进
+                    # 未确认追踪（与 try-acquire 超时分支同一落脚点）——绝不因
+                    # "锁拿到了"就把没确认退出的进程当已收口。
+                    self._track_unconfirmed_proc(p)
+            else:
+                self._track_unconfirmed_proc(p)
+
+    def _track_unconfirmed_proc(self, proc: subprocess.Popen) -> None:
+        """把未确认退出的首帧进程登记进重试机制（批 6-8b 收尾；R3 条目格式
+        [proc, attempts, abandoned, tracked_at]）：挂到 _unconfirmed_procs 并
+        确保 clip 进入孤儿注册表，sweep 会在 owner 释放 _ff_proc_lock 后确认/
+        补杀。确认失败保留条目并累计重试，达到上限告警标注 abandoned，下一轮
+        sweep 终局处置（记审计日志后清出追踪，缺陷 21）——绝不静默丢弃句柄，
+        也不永久钉住 clip。"""
+        with self._reader_lock:
+            self._unconfirmed_procs.append([proc, 0, False, time.monotonic()])
+        _register_orphan(self)
+
+    def _has_unconfirmed_procs(self) -> bool:
+        with self._reader_lock:
+            return bool(self._unconfirmed_procs)
+
+    def _sweep_unconfirmed_procs(self) -> None:
+        """对未确认退出的首帧进程做有界补杀确认（批 6-8b 收尾；孤儿注册表
+        sweep 调用，GUI 线程）。
+
+        owner（解码线程）持有 _ff_proc_lock 说明其 finally 的 g.close() 正在
+        执行（内部会杀存活进程）——此时有界尝试获取锁失败即留待下次 sweep
+        （绝不阻塞 GUI）；owner 已释放（g.close 完成 / 线程已退出）时获取
+        成功并确认：进程已死则为无操作，仍存活则补杀。
+
+        R3（R2 复审 P1 闭合）：确认失败（poll 异常 / terminate+kill 后仍
+        存活 / 锁竞争超时）**保留条目**并累计 attempts，绝不一次即丢；达到
+        _UNCONFIRMED_KILL_MAX 记录告警并标注 abandoned。缺陷 21：abandoned
+        条目在其后的 sweep 做**终局处置**（记审计日志后清出追踪）——进程已
+        terminate/kill 过、确认是"杀不掉"的残留，再留着只会让
+        ``_has_unconfirmed_procs()`` 恒真、clip 永不被 discard（显示槽帧被
+        注册表强引用钉住），且不再产生任何保护。
+        """
+        with self._reader_lock:
+            if not self._unconfirmed_procs:
+                return
+            pending = list(self._unconfirmed_procs)
+            self._unconfirmed_procs.clear()
+        still: list = []
+        for entry in pending:
+            proc = entry[0]
+            attempts = entry[1]
+            abandoned = entry[2]
+            since = float(entry[3]) if len(entry) > 3 else 0.0
+            if abandoned:
+                self._dispose_abandoned_proc(proc, since)
+                continue
+            if not self._ff_proc_lock.acquire(timeout=_PROC_LOCK_ACQUIRE_TIMEOUT):
+                self._bump_unconfirmed(proc, attempts, still, since)
+                continue
+            try:
+                confirmed = WebMClip._terminate_proc(proc)
+            finally:
+                self._ff_proc_lock.release()
+            if not confirmed:
+                self._bump_unconfirmed(proc, attempts, still, since)
+        if still:
+            with self._reader_lock:
+                self._unconfirmed_procs.extend(still)
+
+    def _dispose_abandoned_proc(self, proc: subprocess.Popen, since: float) -> None:
+        """abandoned 条目的终局处置（缺陷 21）：清出追踪 + 一条审计日志。
+
+        条目走完 _UNCONFIRMED_KILL_MAX 轮补杀仍未确认退出（进程已被
+        terminate+kill 过），属"杀不掉"的残留。审计日志记下 clip 路径与句柄
+        追踪时长，供售后按残留 pid 回查；之后放手——句柄已无任何可操作的
+        收口手段，留在追踪里只会永久钉住 clip。``since`` 为 0（测试/历史形态
+        的三元素条目）时时长按 0 记。
+        """
+        tracked_s = max(0.0, time.monotonic() - since) if since > 0 else 0.0
+        logger.warning(
+            '首帧进程终局处置（确认杀不掉，清出追踪、不再钉住 clip）: '
+            'clip=%s pid=%s 追踪时长=%.1fs',
+            self.path, getattr(proc, 'pid', '?'), tracked_s,
+        )
+
+    def _bump_unconfirmed(self, proc: subprocess.Popen, attempts: int,
+                          still: list, since: float = 0.0) -> None:
+        """未确认退出的一次重试记账（R3）：递增 attempts；达到上限告警并
+        标注 abandoned（下一轮 sweep 终局处置），否则保留待下次 sweep
+        重试——绝不静默丢弃句柄。"""
+        attempts += 1
+        if attempts >= _UNCONFIRMED_KILL_MAX:
+            logger.warning(
+                '首帧进程取消后未确认退出，标注放弃（下一轮 sweep 终局处置）: pid=%s',
+                getattr(proc, 'pid', '?'),
+            )
+            still.append([proc, attempts, True, since])
+        else:
+            still.append([proc, attempts, False, since])
+
+    # ------------------------------------------------------------ reader
+    def _reader(self, stop_evt: threading.Event, generation: int,
+                ready_evt: threading.Event | None = None) -> None:
+        """reader 线程入口：feed 模式（进程内扇出）与本地解码的分派。
+
+        - ``_feed_source`` 为 None（默认/灰度关）：逐位走 ``_reader_local``，
+          与历史行为零差异；
+        - ``_feed_source`` 已置（消费端，facade 在 start() 前设置）：经
+          FanoutFeed 立即就绪（ready 恒 True），从订阅环取帧入队（本地同款
+          有界 put/丢帧契约，节流/暂停期转阻塞背压）；断流/超时/中止 →
+          **同一 reader 线程内**回退本地 ffmpeg 解码（帧 0 起播，重入
+          _reader_local 的拉起序列——capture/登记/兜底全复用，绝不复刻一个
+          绕过追踪的新拉起，P1-1）。
+        """
+        # 批 6-8b：线程启动前已被 stop/换代的 reader 零成本退出——绝不拉起
+        # 任何 ffmpeg 进程（省掉「拉起→_register 发现 stale→自终止」的浪费
+        # 与延迟，也杜绝 stop 无法解除的探测/解码等待）。
+        if stop_evt.is_set() or self._generation != generation:
+            return
+        if session_ending():
+            # 会话结束（关机/注销）：reader 线程绝不拉起 ffmpeg（issue #111）——
+            # 关机窗口期内新起的进程会以 0xc0000142 弹窗阻塞关机。
+            logger.info('会话结束中，reader 拒绝拉起 ffmpeg: %s', self.path)
+            return
+        feed = self._feed_source
+        if feed is not None:
+            done = self._reader_feed(feed, stop_evt, generation, ready_evt)
+            if done:
+                # P2-3（REVIEW_batch12）：feed 自退（自然结束/被停）不经
+                # _reader_local 的 finally，死 Thread 对象清理在此兜底。
+                with self._reader_lock:
+                    if self._thread is threading.current_thread():
+                        self._thread = None
+                return  # feed 已完整处理本轮（自然结束/停止）
+            # 断流/被拒/超时 → 回退本地：清空 feed 残留帧后落本地路径
+            if stop_evt.is_set() or self._generation != generation:
+                return
+            self._drain_queue_for_local()
+            logger.info('fan-out feed 回退本地解码（帧 0 起播）: %s', self.path)
+        self._reader_local(stop_evt, generation, ready_evt)
+
+    def _reader_local(self, stop_evt: threading.Event, generation: int,
+                      ready_evt: threading.Event | None = None) -> None:
+        # 批 6-8b：线程启动前已被 stop/换代的 reader 零成本退出——绝不拉起
+        # 任何 ffmpeg 进程（省掉「拉起→_register 发现 stale→自终止」的浪费
+        # 与延迟，也杜绝 stop 无法解除的探测/解码等待）。
+        if stop_evt.is_set() or self._generation != generation:
+            return
+        # ffmpeg exe 探测串行化预热（见模块级 _ensure_ffmpeg_exe）：并发
+        # reader 不再各自跑 ffmpeg -version 探测（无限等待的 check_call）。
+        _ensure_ffmpeg_exe()
+        if stop_evt.is_set() or self._generation != generation:
+            return  # 探测期间被 stop：不拉起解码进程，直接退出
+        if session_ending():
+            # 会话结束（关机/注销）：本地解码路径绝不 spawn（issue #111）。
+            # 覆盖 feed 回退本地与任何绕过 start() 的迟到 reader。
+            logger.info('会话结束中，本地 reader 拒绝拉起 ffmpeg: %s', self.path)
+            return
+        gen = None
+        proc = None
+        try:
+            q = self._queue
+
+            def _register(p: subprocess.Popen, argv) -> None:
+                """解码进程 Popen 一拉起即回调（可能发生在头部解析阻塞期间）：
+                登记进程句柄，让 stop() 能立即 terminate；若本轮已被 stop/换代，
+                则立即自终止。
+
+                只认解码进程（argv 含 '-i <path>'）：imageio 的 ffmpeg exe 探测
+                （ffmpeg -version）也在 reader 线程上拉起，不能登记/终止，否则
+                探测会被误杀导致 get_ffmpeg_exe 失败。
+                """
+                nonlocal proc
+                if not (isinstance(argv, list) and "-i" in argv):
+                    return  # ffmpeg exe 探测等非解码进程：忽略
+                proc = p
+                # stale 判定与登记在 _reader_lock 内原子完成（R3 收尾，与首帧
+                # 路径同构）：stop() 先 set stop_evt、再取 _reader_lock。若 stale
+                # 在锁外先算、锁内再复查，会留下「外层 False → 锁内 True → 既
+                # 不登记也不自终止」的窗口——进程存活且无任何追踪，stop 拿不到
+                # handle 无法解除其阻塞读（reader 卡死 + LogCatcher 残留的全量
+                # 偶发 flake 根因）。锁内单次判定保证：要么完成登记（stop 可见
+                # handle 并解除阻塞读），要么判定 stale 并立即自终止，绝不漏。
+                with self._reader_lock:
+                    stale = stop_evt.is_set() or self._generation != generation
+                    if not stale:
+                        self._reader_proc = p
+                if stale:
+                    self._terminate_proc(p)
+
+            # 批8 进程内循环：仅帧数精确已知（count_frames_and_secs 或其
+            # 缓存；fps×duration 估算值 ±1 会逐圈相位漂移，P2-5）才带
+            # -stream_loop/-readrate 并做取模回绕；帧数未知/估算 → 退化为
+            # 播一遍自然结束（现状路径，P2-3，无限流永不终止的泄漏不成立）。
+            # -readrate 随 playback_speed 缩放（P2-4：speed>1 时钉死 1 会把
+            # 解码封顶在原生帧率，消费端 36fps 对解码端 24fps → 队列饥饿）；
+            # speed<=1 恒为 1。背压（队列/管道写满）在 readrate 之上仍然生效。
+            loop_frame_count = (
+                self._frame_count
+                if self._frame_count > 0 and self._frame_count_exact
+                else 0
+            )
+            input_params = list(_FFMPEG_INPUT_PARAMS)
+            if loop_frame_count > 0:
+                input_params += ['-stream_loop', '-1',
+                                 '-readrate', str(max(1.0, self.playback_speed))]
+            # 批11-B1：记录当前 ffmpeg 进程出生时刻并清零圈数（圈边界回收
+            # 判定/日志用；reader 线程写，Reader 读同线程）。只在此处记录一次，
+            # feed 路径（不拉起 ffmpeg）不会走到这里，_reader_born_at 保持 0。
+            self._reader_born_at = time.monotonic()
+            self._reader_loops = 0
+            if session_ending():
+                # 会话结束（issue #111）：门禁检查之后、Popen 之前再复查一次，
+                # 收紧并发的关机窗口；随后由 finally 走既有收尾（无句柄泄漏）。
+                return
+            with _PopenCapture(on_process=_register) as capture:
+                gen = imageio_ffmpeg.read_frames(
+                    str(self.path),
+                    pix_fmt='rgba',
+                    bits_per_pixel=self._bpp * 8,
+                    input_params=input_params,
+                )
+                meta = next(gen)  # ffmpeg 进程在此拉起；capture 即时登记句柄
+                if proc is None:
+                    proc = capture.process
+            if proc is not None:
+                # 兜底登记：capture 即时回调已覆盖，此处仅防异常路径遗漏。
+                # stale 时不能只跳过登记——进程逃出追踪链（5.6sol 三审），
+                # 与 _register 回调同构：判定 stale 则立即自终止（幂等，
+                # 已死进程 terminate 是 no-op）。
+                with self._reader_lock:
+                    stale = stop_evt.is_set() or self._generation != generation
+                    if not stale:
+                        self._reader_proc = proc
+                if stale:
+                    self._terminate_proc(proc)
+            if ready_evt is not None:
+                ready_evt.set()
+            if stop_evt.is_set() or self._generation != generation:
+                return
+            # 用实际流信息修正元数据
+            if meta.get('fps'):
+                self._fps = float(meta['fps'])
+            if meta.get('duration'):
+                self._duration = float(meta['duration'])
+            if self._frame_count <= 0 and self._fps > 0 and self._duration > 0:
+                self._frame_count = int(round(self._fps * self._duration))
+
+            # 批8 进程内循环：frame_count > 0 时按它回绕源帧号，每圈边界经
+            # _loop_boundary 交付一次结束标记并驻留等续圈；loop_end 记录
+            # 「圈边界已交付过结束标记后退出」，避免下方再重复放入一个。
+            loop_end = {'reported': False}
+
+            def _on_loop_boundary() -> bool:
+                ok = self._loop_boundary(q, stop_evt, generation)
+                if not ok:
+                    loop_end['reported'] = True
+                return ok
+
+            self._stamp_source_indices(
+                gen,
+                q,
+                lambda: stop_evt.is_set() or self._generation != generation,
+                # 节流（闲置降帧）或**暂停**（隐藏/挂起）：暂停期消费端不取帧，
+                # 队列写满必须转成背压阻塞而不是丢帧——否则暂停 = 队列持续满 =
+                # reader 持续解码持续丢帧，暂停位置丢失、隐藏期 CPU 白烧
+                # （见 pause() 的承诺与 _stamp_source_indices 的 throttled 语义）。
+                throttled=lambda: self._decode_throttle_divisor > 1 or self._paused,
+                # 共享解码：发布镜像（发布端播放时置 _publish_sink）。
+                # reader 只做每帧回调（逐帧读当前 sink——续圈后 facade 重建
+                # 会话换 sink，不换 reader/进程仍发布到新会话）；节拍/收尾由
+                # facade 在 GUI 侧驱动（P1-2），reader 不写标记。
+                on_frame=self._mirror_frame_to_sink,
+                loop_frame_count=loop_frame_count,
+                on_loop_boundary=_on_loop_boundary,
+            )
+            if loop_end['reported']:
+                return  # 圈边界已交付结束标记，finally 照常收尾杀进程
+            # 正常播完（有限流，如测试桩）时放入结束标记。主线程可能正忙
+            # （队列满、帧被丢弃），必须循环重试直到放入或收到停止信号；
+            # 否则“最后一帧被丢弃且结束标记也丢失”会让上层永远等不到播完，
+            # 动画链卡死在最后一帧。
+            # 重试有总时限（Fix C）：病态场景（队列持续满）下有界放弃，绝不
+            # 永久空转；_terminate_proc / gen.close() 由 finally 保证。
+            self._put_end_marker(q, stop_evt, generation)
+        except Exception as exc:
+            if self._generation != generation or stop_evt.is_set():
+                return
+            logger.exception('webm 解码失败: %s', self.path)
+            self.errorOccurred.emit(str(exc))
+            # 异常中断也要放入结束标记，避免动画链卡在最后一帧（同样有界）。
+            self._put_end_marker(q, stop_evt, generation)
+        finally:
+            with self._reader_lock:
+                if proc is not None and self._reader_proc is proc:
+                    self._reader_proc = None
+                # B1：reader 自行退出的三条路径（软停宽限满 _loop_boundary
+                # gate 超时、批11 圈界回收、自然播完 _put_end_marker 返回）
+                # 都不清 self._thread → 死 Thread 对象每 clip 钉 1 个 OS 线程
+                # 句柄。仅当 _thread 仍指向本 reader 线程时置 None——复播换代
+                # 时 start() 既有摘取逻辑已把旧 thread 摘进退役池（或已置
+                # None），此时 _thread 指向新线程/None，绝不能误清（不要双清）。
+                if self._thread is threading.current_thread():
+                    self._thread = None
+            # A1 复审修订（REVIEW_batch12 P1-1/P1-2）：reader 线程**不清显示槽**
+            # ——clip 自己无法区分「park 后被放弃」与「park 但仍在显示」（hold
+            # 路径），且跨线程写 _current_pixmap 违反「Qt 操作只在主线程」。
+            # 清槽由窗口在 _switch 切走时按权威显示状态执行（GUI 线程）。
+            if proc is not None or gen is not None:
+                # 批 6-8b：收尾操作（_terminate_proc 的 poll/terminate/wait/kill +
+                # gen.close() 的 poll/关管道）在 _proc_lock 内串行化——与 GUI
+                # stop() 的 _unblock_proc 互斥，同一 Popen 任意时刻只有一个线程
+                # 操作（Windows 原生竞态崩溃根因）。
+                #
+                # 代码路径保证（针对「gen.close() 1.5s 轮询被短路」的条件性）：
+                # - 路径 A（正常，proc 已捕获）：先 _terminate_proc 杀进程，再
+                #   gen.close()。实测 imageio-ffmpeg 0.6.0 的 close() 首先
+                #   `process.poll()` 判活——进程已死（returncode 已知）时整个
+                #   「存活进程清理块」（关管道 + 1.5s 轮询 + kill，_io.py
+                #   finally 的 `if process.poll() is None:` 分支）被跳过，
+                #   锁持有上界 = _terminate_proc 时间（正常毫秒级，无 1.5s）。
+                # - 路径 B（兜底，proc 句柄捕获失败 = capture 未看到进程）：
+                #   只剩 gen.close() 执行终止——imageio finally 内 poll 判活 →
+                #   关管道 → 1.5s 轮询 → kill，锁持有时间病态可达 ~1.5s。
+                #   这是捕获失败这一罕见异常路径的代价上界（可接受：进程
+                #   仍必被终止，只是时间更长）。
+                with self._proc_lock:
+                    if proc is not None:
+                        if mem_debug.ENABLED:
+                            mem_debug.bump('ff_done')  # 取证：已收尾的解码进程数
+                        # 兜底 terminate：正常情况下 stop() 已解除阻塞/终止；
+                        # 自然播完/解码失败时进程已自行退出（poll()!=None），
+                        # 此处为无操作。
+                        self._terminate_proc(proc)
+                    if gen is not None:
+                        try:
+                            gen.close()
+                        except Exception:
+                            pass
+
+    # ------------------------------------------------------------ P3 broker
+    def _reader_feed(self, feed, stop_evt: threading.Event, generation: int,
+                     ready_evt: threading.Event | None = None) -> bool:
+        """feed 分支（reader 线程内）。返回 True = 本轮已由 feed 完整处理
+        （feed 就绪并流完自然结束 / 或已被 stop 打断）；False = 需要回退
+        本地解码（feed 就绪前超时/断流/中止——测试桩驱动该等待路径）。
+
+        只在该 WebMClip 以消费端身份、facade 在 start() 前设置了
+        ``_feed_source`` 时进入。feed 等待/读取期间不持有任何锁；入队沿用本地
+        同款契约——队列满即丢帧、源帧号照常推进，**节流/暂停期例外**（转阻塞
+        背压，见下方分支：暂停期丢帧会把暂停位置丢穿）。
+        """
+        # 1) feed-pending：有界等待 feed 就绪（reader 线程内，≤SUBSCRIBE_BUDGET_MS）
+        budget_ms = getattr(feed, 'budget_ms', None) or _SUBSCRIBE_BUDGET_MS
+        deadline = time.monotonic() + max(1, int(budget_ms)) / 1000.0
+        while not (stop_evt.is_set() or self._generation != generation):
+            if feed.ready:
+                break
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.005)
+        if stop_evt.is_set() or self._generation != generation:
+            # 等待期被 stop/换代：闭锁本 feed——若 grant 恰在此时落定，session
+            # 由 expire 立即 close（绝不遗留无主句柄）；迟到的 grant 同样被
+            # close 而非 complete（P3A P1-2：attach 句柄必须有主）。
+            feed.expire()
+            return True  # 由调用方退出，无残留
+        feed_session = feed.result if feed.ready else None
+        if feed_session is None:
+            # deny / 超时 / 通道不可用：授权失败 → 本地解码（帧 0 起播）。
+            # expire 闭锁本 feed：晚到的 grant 命中已闭锁句柄 → 立即 close，
+            # 不再 complete（reader 已不再等待该 Event）。
+            feed.expire()
+            logger.info('fan-out feed 授权失败（deny/超时），回退本地解码: %s', self.path)
+            return False
+        if ready_evt is not None:
+            ready_evt.set()  # feed 已就绪：等价于本地 ffmpeg 拉起完成的信号
+        q = self._queue
+        try:
+            while not (stop_evt.is_set() or self._generation != generation):
+                result = feed_session.poll()
+                kind = result[0]
+                data = result[1]
+                src = result[2]
+                # F1：poll 协议对 abort 透传 reason（'handover'|'disband'|
+                # 'stop_all'|'watchdog'）；兼容外部 feed 会话（测试桩）只返回 3 元组。
+                reason = result[3] if len(result) > 3 else None
+                if kind == 'frame':
+                    if self._decode_throttle_divisor > 1 or self._paused:
+                        # 节流/暂停：阻塞入队（背压），不丢帧、不虚推进——与
+                        # _stamp_source_indices 的节流分支同款语义（暂停期消费端
+                        # 不取帧，丢帧路径会把暂停位置丢穿）。停止/换代判定夹在
+                        # 每次重试之间，阻塞中的 reader 照样能及时退出。
+                        while not (stop_evt.is_set()
+                                   or self._generation != generation):
+                            try:
+                                q.put((data, src), timeout=0.2)
+                                break
+                            except queue.Full:
+                                continue
+                        # 阻塞期间不调 poll，看门狗（无帧无 end 超预算即 abort）
+                        # 会把"暂停"误判成源断流：放行后一到 poll 就落回本地
+                        # ffmpeg 帧 0 起播（暂停语义被破坏）。这里按"消费端仍
+                        # 在、只是被背压按住"重置一次计时（与 poll 每帧重置同源）。
+                        reset_stall = getattr(feed_session, 'reset_stall', None)
+                        if callable(reset_stall):
+                            reset_stall()
+                    else:
+                        try:
+                            q.put((data, src), timeout=0.2)
+                        except queue.Full:
+                            if perfstats.ENABLED:
+                                perfstats.note('webm.queue_drop')
+                            pass  # 队列满丢帧：源帧号照常推进（本地同款契约）
+                elif kind == 'end':
+                    # 源帧号回绕合成 end：结束标记 → finished
+                    self._put_end_marker(q, stop_evt, generation)
+                    return True
+                elif kind == 'abort':
+                    if reason in ('handover', 'disband'):
+                        # F1：handover 扶正为发布者 / disband 源解散重建都是设计内
+                        # 行为，不是故障——打 INFO（回退后由本窗后续切换收尾）。
+                        logger.info(
+                            'fan-out %s（设计内），本地解码重启: %s',
+                            reason, self.path)
+                    else:
+                        logger.warning(
+                            'fan-out feed 断流/中止，回退本地解码: %s', self.path)
+                    return False
+                else:  # 'none'：暂无新帧，微让步避免忙等
+                    time.sleep(0.002)
+            return True  # 被 stop/换代：调用方直接退出
+        finally:
+            try:
+                feed_session.close()
+            except Exception:
+                pass
+
+    def _drain_queue_for_local(self) -> None:
+        """回退本地解码前清空队列残留的 feed 帧（P1-1：feed → 本地 帧 0
+        起播，不得与旧 feed 帧混序显示）。只清不阻塞；GUI 线程可能正在消费，
+        二者并发安全（queue.Queue 线程安全）。"""
+        q = self._queue
+        while True:
+            try:
+                q.get_nowait()
+            except queue.Empty:
+                return
+
+    def _poll(self) -> None:
+        """主线程按视频帧率逐帧取帧，不跳帧、不积压追帧。
+
+        注意：不能一次清空队列只处理最新帧，否则会把中间帧丢弃，
+        导致动画视觉上“快进”。这里每次只取最早的一帧。
+        """
+        self._flush_pending_interval()  # 排队的变速在本次 timeout 落地（零代价）
+        try:
+            item = self._queue.get_nowait()
+        except queue.Empty:
+            if perfstats.ENABLED:
+                # 消费端空转（解码还没跟上/未开始）：P0 观测。
+                perfstats.note('webm.poll_empty')
+            return
+
+        if item is None:
+            # 正常播完（进程内循环模式下 = 一圈结束）；若在处理最后一帧时已经
+            # 由窗口层启动了下一个动画，self._queue 已被替换，不会走到这里。
+            # 批8：标记圈末自然结束——随后上层 stop() 据此转软停驻留等续圈。
+            self._natural_end_pending = True
+            if not self._ended_fired:
+                self._ended_fired = True
+                self._running = False
+                self._timer.stop()
+                self.finished.emit()
+            return
+
+        self._process_frame(item)
+
+    def _put_end_marker(self, q, stop_evt, generation) -> bool:
+        """有界重试把结束标记（None）放入队列（Fix C）。返回是否送达。
+
+        正常路径队列很快腾出槽位、首次即送达（保住「最后一帧/结束标记必须
+        送达」契约）；仅病态（队列持续满且无人消费、stop_evt 缺失的历史
+        僵尸）在 _END_MARKER_PUT_TIMEOUT 内有界放弃并告警，绝不永久空转。
+        调用方（_reader）的 finally 仍保证 _terminate_proc 与 gen.close()。
+        """
+        deadline = time.monotonic() + _END_MARKER_PUT_TIMEOUT
+        while not stop_evt.is_set() and self._generation == generation:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                logger.warning(
+                    'webm 结束标记放入超时放弃（队列持续满）: %s', self.path,
+                )
+                return False
+            try:
+                q.put(None, timeout=min(0.5, remaining))
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def _loop_boundary(self, q, stop_evt, generation) -> bool:
+        """圈边界（批8，reader 线程）：交付「播完」结束标记后驻留等续圈。
+
+        返回 True = 续播下一圈（re-arm 已发生）；False = 退出 reader
+        （被停止/换代，或宽限期满无人续圈，或 批11-B1 圈边界回收——切走/
+        被打断/回收的 clip 自行退出，由 _reader_local 的 finally 杀掉
+        ffmpeg，绝不泄漏常驻进程）。
+
+        「结束标记至多交付一次」：reader 在 _loop_lock 内检查
+        _rearm_pending 决定跳过/发出标记，re-arm（_rearm_loop_reader）在
+        同一把锁内置位并排空腹中标记——两案互斥。锁内做 put 是安全的：
+        上层只有消费到末帧/结束标记后才会 re-arm（此时队列必有空间，
+        put 不会阻塞；队列满 = 上层尚未消费到圈末 = 不可能有 re-arm 在等锁）。
+
+        批11-B1 回收只在本点（圈边界、结束标记已交付、_rearm_pending 未置位）
+        评估：到达回收阈值的一圈结束不做 park/re-arm，直接退出（下一次
+        start() 自然 fresh spawn）。判定在 _loop_lock 内完成，与 re-arm 的
+        gate/标记互斥原子；re-arm 若恰在并发等待 ack，会因 reader 未 ack 而
+        超时回滚落回 fresh start（既有 P1-2 语义），不破坏状态。
+        """
+        # 批11-B1：本圈已完成（到达圈边界），累计当前进程圈数（回收日志用）。
+        self._reader_loops += 1
+        with self._loop_lock:
+            if self._rearm_pending:
+                # 上层已续圈（末帧路径先于结束标记路径完成调度）：跳过本圈
+                # 结束标记直接续圈，绝不重复上报一圈结束。re-arm 置位的
+                # gate 一并清掉——本圈不经驻留，否则下一圈边界会被残留的
+                # gate 直通而跳过驻留（软停判定依赖驻留，会退化成杀进程）。
+                self._rearm_pending = False
+                self._loop_gate.clear()
+                self._loop_ack.set()  # 唤醒握手：re-arm 在等 ack（P1-2）
+                return True
+            delivered = self._put_end_marker(q, stop_evt, generation)
+            # 标记已发出（本圈结束已上报）：无论随后被 _poll 消费还是被
+            # re-arm 排空，下一圈边界都不得因此跳过标记。
+            self._boundary_marker_pending = delivered
+            # 批11-B1：圈边界回收。结束标记已交付、re-arm 未置位（无 pending
+            # re-arm）、且本圈是「本来就要 park」的圈末驻留点 → 若当前 ffmpeg
+            # 进程存活已达阈值，不做 park/re-arm，直接返回 False（reader 退出、
+            # finally 杀进程），下一次 start() 自然 fresh spawn。只在圈边界
+            # （本点）动手，绝不播放中途杀进程；判定幂等（每圈只在本点评估）。
+            if (delivered
+                    and not stop_evt.is_set()
+                    and self._generation == generation
+                    and self._recycle_due()):
+                self._reader_parked = False
+                logger.info(
+                    'webm 圈边界回收 ffmpeg（age=%.1fs loops=%d）: %s',
+                    time.monotonic() - self._reader_born_at,
+                    self._reader_loops, self.path,
+                )
+                if perfstats.ENABLED:
+                    perfstats.note('ffmpeg.recycle')
+                return False
+        if stop_evt.is_set() or self._generation != generation:
+            return False
+        if not delivered:
+            # 结束标记放不进去（队列持续满 = 消费端已停/clip 被遗弃）：
+            # 不驻留，立即退出（finally 杀进程），不白占一个宽限期。
+            return False
+        # 驻留等续圈：硬停（stop_evt）会同时 set gate 唤醒；宽限期满未续圈
+        # 自行退出。驻留期间不再读流，ffmpeg 由管道背压阻塞（近零 CPU）。
+        # _reader_parked 向 GUI 侧的软停判定广告「正驻留在循环边界」——
+        # 只对驻留中的 reader 软停才有意义（feed 路径/退出中的 reader
+        # 不驻留，绝不能软停）。
+        self._reader_parked = True
+        got = self._loop_gate.wait(_LOOP_REARM_GRACE_SECS)
+        self._reader_parked = False
+        if stop_evt.is_set() or self._generation != generation:
+            return False
+        if not got:
+            logger.info('webm 圈边界宽限期满未续圈，reader 退出: %s', self.path)
+            # 复审 P2-1：复位软停驻留标记——reader 退出后 clip 处于
+            # 「_running=False, _soft_parked=True」的死而未僵状态，hub 的
+            # 发布者存活判定会对死发布者说谎（reader 写、GUI 读，GIL 原子
+            # bool，与 _reader_parked 同构）。
+            self._soft_parked = False
+            return False
+        self._loop_gate.clear()
+        with self._loop_lock:
+            self._loop_ack.set()  # 唤醒握手：re-arm 在等 ack（P1-2）
+        return True
+
+    def _mirror_frame_to_sink(self, frame, src_idx) -> None:
+        """共享解码发布镜像：每解码一帧回调当前 publish sink。
+
+        圈边界续圈后共享会话由 facade 重建（_publish_sink 换实例），逐帧
+        读当前 sink 而非 reader 启动时绑定——续圈不换 reader/进程，帧仍
+        发布到新会话。sink 为 None（共享关/非发布端）时为空操作。
+        """
+        sink = self._publish_sink
+        if sink is not None:
+            sink.on_frame(frame, src_idx)
+
+    @staticmethod
+    def _stamp_source_indices(frames, q, is_stopped, timeout: float = 0.2,
+                              throttled=None, on_frame=None,
+                              loop_frame_count: int = 0,
+                              on_loop_boundary=None) -> None:
+        """reader 线程把解码帧逐帧打上素材源时间线帧号后入队。
+
+        队列项 = (RGBA 字节, 源时间线 0-based 帧号)。返回帧号即
+        elapsed video time × fps 对应的素材原始帧号；队列满（UI 消费
+        不过来）时丢弃该帧，但源帧号照常推进——被丢弃的帧仍占用时间线
+        槽位，保证主线程拿到的显示帧索引在丢帧后依然锚定素材时间线
+        （消费计数在丢帧后不再等于源帧号，绝不能用作降帧相位/末帧判断）。
+
+        throttled（批11）：可调用对象，每次入队前求值；返回 True 表示当前
+        解码节流生效（闲置降帧激活，或播放已被 pause 暂停）。节流路径 reader
+        **绝不超时丢帧**，而是按目标呈现节奏阻塞：q.put 有界重试同一帧直到成功
+        或收到停止信号——队列写满即 reader 停步、ffmpeg 的 stdout 管道写满、
+        解码进程阻塞在 write()，解码速率随消费端联动下降到目标节奏（≈原始帧率/
+        ratio；暂停期消费端完全不取帧，解码随之完全停步）。停止检查夹在每次
+        重试之间（有界，_reader 的 finally 仍保证杀进程与 gen.close()，绝不让
+        reader 永久空转）。节流时源帧号只在入队成功后推进——被阻塞重试的帧
+        绝不丢失、绝不虚占时间线槽位。
+        throttled=None（默认）＝永不节流：与历史行为逐位一致（超时丢帧）。
+
+        on_frame（共享解码）：可选回调 on_frame(frame_bytes, src_idx)，
+        每解码一帧调用一次（在节流/丢帧决策之前，即"解码节奏"镜像——
+        发布端按此节奏把帧扇出到各订阅者，见 WebMClip
+        ``_publish_sink`` 钩子）。None（默认）＝零行为差异。
+
+        loop_frame_count（批8 进程内循环）：>0 时按它把解码序号取模回绕成
+        源时间线帧号（ffmpeg -stream_loop -1 持续出第二圈时帧号重新从 0
+        开始，丢帧/节流语义逐位保留）；每圈末帧（回绕前最后一帧）交付后
+        调用 on_loop_boundary()——返回 False 表示停止/宽限超时/换代，
+        立即退出（调用方 finally 收尾）。0/None（默认）＝不循环，
+        与历史行为逐位一致。
+
+        抽取为独立方法便于单元测试：不依赖 ffmpeg/Qt，直接验证
+        「丢帧后帧号连续性与停止语义」（P1 复审）。
+        """
+        src_idx = 0
+        it = iter(frames)
+        while True:
+            if perfstats.ENABLED:
+                _dec_t0 = perfstats.clock()
+            try:
+                frame = next(it)
+            except StopIteration:
+                break
+            if mem_debug.ENABLED:
+                mem_debug.bump('frames_dec')  # 取证：reader 侧解码帧数
+            if is_stopped():
+                break
+            timeline_idx = (src_idx % loop_frame_count) if loop_frame_count > 0 else src_idx
+            if on_frame is not None:
+                on_frame(frame, timeline_idx)
+            if perfstats.ENABLED:
+                # 帧间隔 = ffmpeg 解码 + 管道交付一帧的耗时（reader 侧，
+                # P0 观测：不把下方入队阻塞计入解码耗时）。
+                perfstats.time('webm.decode', perfstats.clock() - _dec_t0)
+            if throttled is not None and throttled():
+                # 节流路径：阻塞入队（背压），不丢帧、不虚推进源帧号。
+                if perfstats.ENABLED:
+                    _put_t0 = perfstats.clock()
+                while not is_stopped():
+                    try:
+                        q.put((frame, timeline_idx), timeout=timeout)
+                        src_idx += 1
+                        break
+                    except queue.Full:
+                        continue  # 队列仍满：同一帧继续阻塞重试
+                if perfstats.ENABLED:
+                    perfstats.time('webm.queue_wait', perfstats.clock() - _put_t0)
+            else:
+                if perfstats.ENABLED:
+                    _put_t0 = perfstats.clock()
+                try:
+                    q.put((frame, timeline_idx), timeout=timeout)
+                except queue.Full:
+                    if perfstats.ENABLED:
+                        perfstats.note('webm.queue_drop')
+                    pass  # 丢弃该帧；源帧号照常推进（时间线槽位不因丢帧回退）
+                if perfstats.ENABLED:
+                    perfstats.time('webm.queue_wait', perfstats.clock() - _put_t0)
+                src_idx += 1
+            # 圈边界（批8）：末帧交付后回调（结束标记 + 驻留等续圈在回调里）。
+            # 被停止的节流重试不触发边界（帧未交付，不算一圈播完）。
+            if (loop_frame_count > 0 and on_loop_boundary is not None
+                    and timeline_idx == loop_frame_count - 1
+                    and not is_stopped()):
+                if not on_loop_boundary():
+                    return  # 停止/续圈被拒/宽限超时：退出（调用方 finally 收尾）
+
+    def _process_frame(self, item) -> None:
+        if mem_debug.ENABLED:
+            mem_debug.bump('frames_cons')  # 取证：GUI 侧消费/渲染帧数
+        data, src_idx = item
+        expect = self._w * self._h * self._bpp
+        if len(data) != expect:
+            logger.warning('webm 帧长度异常: got=%d expect=%d', len(data), expect)
+            return
+        if perfstats.ENABLED:
+            _cons_t0 = perfstats.clock()
+        img = QImage(data, self._w, self._h, self._w * self._bpp,
+                     QImage.Format.Format_RGBA8888)
+        if img.isNull():
+            return
+        self._current_image = img.copy()
+        self._current_pixmap = QPixmap.fromImage(self._current_image)
+        if src_idx == 0 and self._first_image is None:
+            # 播过留热：播放交付的源帧 0 顺手进首帧缓存（GUI 同步解码移除后
+            # 热池的主要来源；warm 闸门 _first_frame_warm 的语义来源不变）。
+            # try-acquire：warm 持锁解码中则跳过（它完成时会写），GUI 绝不阻塞。
+            if self._first_frame_lock.acquire(blocking=False):
+                try:
+                    # 私有深拷贝入缓存：首帧缓存与显示槽之间不共享别名
+                    # （2026-09-22 崩溃消融实验，与 window.py:2089 同批）。
+                    victims = self._store_first_frame(self._current_image.copy())
+                finally:
+                    self._first_frame_lock.release()
+                _ffr_evict(victims)  # 锁外逐出（与既有路径同序）
+        # 显示帧索引 = 素材源时间线 0-based 帧号（reader 打标，丢帧后仍
+        # 一致）；播放计数 _frame_index = 已消费帧数（1-based）。二者分离：
+        # 降帧相位与末帧判断一律使用显示帧索引，绝不使用消费计数
+        # （P1 复审——否则 reader 队列满丢帧后相位错位、末帧提前）。
+        self._current_frame_index = src_idx
+        self._frame_index += 1
+        # 批8：末帧已交付 = 圈末自然结束（与 _poll 消费结束标记等价），
+        # 随后上层 stop() 据此转软停驻留等续圈。
+        if self._frame_count > 0 and src_idx >= self._frame_count - 1:
+            self._natural_end_pending = True
+        if perfstats.ENABLED:
+            # 主线程消费转换（RGBA→QImage→QPixmap）耗时（P0 观测）。
+            perfstats.time('webm.consume', perfstats.clock() - _cons_t0)
+        self.frameChanged.emit(self._current_frame_index)

@@ -1,0 +1,865 @@
+# -*- coding: utf-8 -*-
+"""灵动岛重生：四边停靠/滑出、展开卡片、事件动效、配置清洗。"""
+from __future__ import annotations
+
+import time
+from pathlib import Path
+
+from PySide6.QtCore import QEvent, QEventLoop, QPoint, QPointF, QRect, Qt, QTimer
+from PySide6.QtGui import QColor, QGuiApplication, QImage, QMouseEvent, QPixmap
+from PySide6.QtWidgets import QApplication
+
+from pet.config import Config
+from pet.island.dynamic_island import (
+    DynamicIsland,
+    _CAPSULE_HEIGHT,
+    _CAPSULE_INSET,
+    _EDGE_MARGIN,
+    _STRIP_SIDE,
+    _STRIP_THICKNESS,
+    dock_edge_for,
+    spring_step,
+    strip_rect_for,
+)
+
+
+def _qapp() -> QApplication:
+    return QApplication.instance() or QApplication([])
+
+
+def _island(tmp_path: Path, **overrides) -> DynamicIsland:
+    cfg = Config(base=tmp_path)
+    data = {
+        "enabled": True, "show_icon": True, "show_name": True,
+        "show_info": True, "info_mode": "time", "custom_text": "",
+        "show_status": True, "style": "dark", "x": 400, "y": 300,
+    }
+    data.update(overrides)
+    cfg.set("dynamic_island", data)
+    return DynamicIsland(cfg)
+
+
+def _avail() -> QRect:
+    screen = QGuiApplication.primaryScreen()
+    return screen.availableGeometry() if screen is not None else QRect(0, 0, 1920, 1040)
+
+
+def _mouse(kind: QEvent.Type, widget, global_pos: QPoint,
+           button=Qt.MouseButton.LeftButton,
+           buttons=Qt.MouseButton.LeftButton) -> QMouseEvent:
+    local = widget.mapFromGlobal(global_pos)
+    return QMouseEvent(kind, QPointF(local), QPointF(global_pos),
+                       button, buttons, Qt.KeyboardModifier.NoModifier)
+
+
+def _drag_to(widget, target_global: QPoint) -> None:
+    """完整拖一次：按下 → 移动（超过拖拽阈值）→ 在 target 松手。"""
+    start = widget.geometry().center()
+    widget.mousePressEvent(_mouse(QEvent.Type.MouseButtonPress, widget, start))
+    mid = QPoint((start.x() + target_global.x()) // 2,
+                 (start.y() + target_global.y()) // 2)
+    widget.mouseMoveEvent(_mouse(QEvent.Type.MouseMove, widget, mid))
+    widget.mouseMoveEvent(_mouse(QEvent.Type.MouseMove, widget, target_global))
+    widget.mouseReleaseEvent(
+        _mouse(QEvent.Type.MouseButtonRelease, widget, target_global,
+               buttons=Qt.MouseButton.NoButton))
+
+
+def _click(widget) -> None:
+    center = widget.geometry().center()
+    widget.mousePressEvent(_mouse(QEvent.Type.MouseButtonPress, widget, center))
+    widget.mouseReleaseEvent(
+        _mouse(QEvent.Type.MouseButtonRelease, widget, center,
+               buttons=Qt.MouseButton.NoButton))
+
+
+def _drive_anim(widget, max_ticks: int = 60) -> None:
+    """按真实定时器节奏驱动几何动画到结束（含 _geo_t>=1 的收尾重算）。
+
+    _finish_animations 是从"动画起点几何"直接跳终点，掩盖不了收尾重算
+    在窗口已落位细条后的再 derivation；这里逐 tick 推进才等价实机路径。
+    """
+    for _ in range(max_ticks):
+        if not widget._anim_timer.isActive():
+            return
+        widget._anim_last = time.monotonic() - 0.05  # 强制 dt=50ms/帧
+        widget._on_anim_tick()
+
+
+# ------------------------------------------------------------ 纯函数
+def test_spring_step_converges_and_overshoots():
+    value, velocity = 1.0, 6.0  # 事件冲量
+    peak = value
+    for _ in range(600):
+        value, velocity = spring_step(value, velocity, 1.0, 1 / 60)
+        peak = max(peak, value)
+    assert peak > 1.05  # 有过冲才有果冻感
+    assert abs(value - 1.0) < 0.01
+    assert abs(velocity) < 0.05
+
+
+def test_dock_edge_for_four_edges_and_none():
+    available = QRect(0, 0, 1920, 1040)
+    capsule = QRect(900, 300, 200, 44)
+    assert dock_edge_for(capsule, available) == "none"
+    assert dock_edge_for(QRect(900, 2, 200, 44), available) == "top"
+    assert dock_edge_for(QRect(900, 1035 - 44, 200, 44), available) == "bottom"
+    assert dock_edge_for(QRect(3, 500, 200, 44), available) == "left"
+    assert dock_edge_for(QRect(1917 - 200, 500, 200, 44), available) == "right"
+
+
+def test_strip_rect_shapes():
+    available = QRect(0, 0, 1920, 1040)
+    capsule = QRect(900, 2, 200, 44)
+    top = strip_rect_for(capsule, "top", available)
+    assert top.y() == 0 and top.height() == _STRIP_THICKNESS and top.width() == 200
+    bottom = strip_rect_for(capsule, "bottom", available)
+    assert bottom.bottom() == available.bottom() and bottom.height() == _STRIP_THICKNESS
+    left = strip_rect_for(capsule, "left", available)
+    assert left.x() == 0 and left.width() == _STRIP_THICKNESS
+    # 左右竖条按胶囊真实几何中心（top + height//2）居中：QRect::center()
+    # 对偶数尺寸向下取整差 1px，会让滑出/收回每循环漂 1px
+    capsule = QRect(900, 300, 200, 44)
+    assert strip_rect_for(capsule, "left", available).y() == \
+        300 + _CAPSULE_HEIGHT // 2 - 32
+    right = strip_rect_for(capsule, "right", available)
+    assert right.right() == available.right() and right.width() == _STRIP_THICKNESS
+    assert strip_rect_for(capsule, "none", available) == capsule
+
+
+# ------------------------------------------------------------ 停靠与滑出
+def test_drag_to_edge_docks_and_hover_peeks(tmp_path):
+    _qapp()
+    island = _island(tmp_path)
+    try:
+        island.show()
+        available = _avail()
+        # 拖到顶边 → 停靠成细条
+        _drag_to(island, QPoint(island.x(), available.top()))
+        island._finish_animations()
+        assert island._debug_state()["mode"] == "docked"
+        assert island._debug_state()["dock_edge"] == "top"
+        assert island.height() == _STRIP_THICKNESS
+        assert island.y() == available.top()
+        # 配置已持久化
+        assert island.config.get("dynamic_island")["dock_edge"] == "top"
+
+        # 鼠标靠近 → 滑出完整胶囊
+        island.enterEvent(None)
+        island._finish_animations()
+        assert island.height() == 44
+        # 鼠标离开 → 延迟后收回细条
+        island.leaveEvent(None)
+        island._dock_back()  # 直接驱动定时器回调
+        island._finish_animations()
+        assert island.height() == _STRIP_THICKNESS
+
+        # 拖离顶边（屏幕可用区正中心，不赌分辨率）→ 回到正常模式
+        _drag_to(island, available.center())
+        island._finish_animations()
+        assert island._debug_state()["mode"] == "normal"
+        assert island._debug_state()["dock_edge"] == "none"
+        assert island.height() == 44
+    finally:
+        island.hide()
+        island.deleteLater()
+
+
+def test_left_edge_hover_cycles_do_not_drift(tmp_path):
+    """左右停靠细条在 滑出→收回 循环后必须原地不动（回归：每次收回动画
+    结束细条上窜 ~11px≈2.6mm 反复累计）。
+
+    根因一：动画收尾重算（_on_anim_tick 到位后调 _target_rect）时窗口已
+    落成 64 高细条，旧代码按"细条左上角 + 胶囊尺寸"拼参考矩形，中心凭空
+    上移半个高度差；根因二：strip_rect_for 用 QRect::center()（偶数尺寸
+    向下取整差 1px），与滑出方向的整数居中公式不对称。
+    """
+    _qapp()
+    island = _island(tmp_path)
+    try:
+        island.show()
+        available = _avail()
+        # 拖到左边缘 → 停靠成竖条（逐 tick 驱动，覆盖真实收尾重算路径）
+        _drag_to(island, QPoint(available.left() + 4, island.geometry().center().y()))
+        release_center_y = island.y() + island.height() // 2  # 松手时胶囊中心
+        _drive_anim(island)
+        assert island._debug_state()["dock_edge"] == "left"
+        strip0 = island.geometry()
+        # 停靠瞬间不跳：细条以松手时胶囊真实中心居中
+        assert strip0.width() == _STRIP_THICKNESS
+        assert strip0.y() + _STRIP_SIDE // 2 == release_center_y
+        # 已停靠状态下 _target_rect 必须幂等（收尾重算/显示恢复都靠它）
+        assert island._target_rect() == strip0
+
+        for _ in range(3):
+            island.enterEvent(None)
+            _drive_anim(island)
+            # 滑出的胶囊与细条同心（真实几何中心，不用 floor 的 center()）
+            assert island.height() == _CAPSULE_HEIGHT
+            assert island.y() + island.height() // 2 == \
+                strip0.y() + strip0.height() // 2
+            island.leaveEvent(None)
+            island._dock_back()
+            _drive_anim(island)
+            # 收回后细条分毫不差（不向上窜）
+            assert island.geometry() == strip0
+    finally:
+        island.hide()
+        island.deleteLater()
+
+
+def test_edge_dock_disabled_never_docks(tmp_path):
+    _qapp()
+    island = _island(tmp_path, edge_dock=False)
+    try:
+        island.show()
+        available = _avail()
+        _drag_to(island, QPoint(island.x(), available.top()))
+        island._finish_animations()
+        assert island._debug_state()["mode"] == "normal"
+        assert island._debug_state()["dock_edge"] == "none"
+    finally:
+        island.hide()
+        island.deleteLater()
+
+
+# ------------------------------------------------------------ 展开卡片
+def test_click_expands_card_and_buttons_emit(tmp_path):
+    app = _qapp()
+    island = _island(tmp_path)
+    try:
+        island.show()
+        island.set_balance_info("高峰 → 23:00", "余额 ¥12.34")
+        island.set_last_message("我吃了三碗饭")
+        got = {"toggle": 0, "chat": 0, "settings": 0}
+        island.toggle_pet_requested.connect(lambda: got.__setitem__("toggle", 1))
+        island.open_chat_requested.connect(lambda: got.__setitem__("chat", 1))
+        island.open_settings_requested.connect(lambda: got.__setitem__("settings", 1))
+
+        _click(island)
+        island._finish_animations()
+        app.processEvents()
+        state = island._debug_state()
+        assert state["mode"] == "expanded"
+        assert state["card_visible"] is True
+        assert island._card_balance_label.text() == "余额 ¥12.34"
+        assert island._card_message_label.text() == "我吃了三碗饭"
+
+        island._card_toggle_btn.click()
+        island._card_chat_btn.click()
+        island._card_settings_btn.click()
+        assert got == {"toggle": 1, "chat": 1, "settings": 1}
+        # 任一按钮动作后卡片收起
+        assert island._debug_state()["mode"] == "normal"
+
+        # 再点一次胶囊 → 展开；再点 → 收起
+        _click(island)
+        island._finish_animations()
+        assert island._debug_state()["mode"] == "expanded"
+        _click(island)
+        island._finish_animations()
+        assert island._debug_state()["mode"] == "normal"
+    finally:
+        island.hide()
+        island.deleteLater()
+        app.processEvents()
+
+
+def test_click_toggle_pet_legacy_action(tmp_path):
+    _qapp()
+    island = _island(tmp_path, click_action="toggle_pet")
+    try:
+        island.show()
+        clicks = []
+        island.clicked.connect(lambda: clicks.append(1))
+        _click(island)
+        assert clicks == [1]
+        assert island._debug_state()["mode"] == "normal"  # 不展开卡片
+    finally:
+        island.hide()
+        island.deleteLater()
+
+
+# ------------------------------------------------------------ 事件动效
+def test_notify_event_starts_animation_only_when_enabled(tmp_path):
+    _qapp()
+    island = _island(tmp_path)
+    try:
+        island.show()
+        assert island._debug_state()["animating"] is False
+        island.notify_event("reply")
+        assert island._debug_state()["animating"] is True
+        island._finish_animations()
+        assert island._debug_state()["animating"] is False
+
+        island._cfg = dict(island._cfg, event_effects=False)
+        island.notify_event("reply")
+        assert island._debug_state()["animating"] is False
+    finally:
+        island.hide()
+        island.deleteLater()
+
+
+def test_bump_and_agent_active(tmp_path):
+    _qapp()
+    island = _island(tmp_path)
+    try:
+        island.show()
+        island.bump(2.0, 1.0, 0.0)  # 果冻墙受击：表面压扁回弹 + 定向踢动
+        assert island._debug_state()["animating"] is True
+        assert island._tilt_v != 0.0
+        assert island._kick_vx > 0.0  # 踢动方向跟随撞击方向
+        assert island._squish_v < 0.0  # 表面被压扁（弹簧回摆出果冻抖动）
+        island._finish_animations()
+        assert island._tilt == 0.0
+        assert island._kick_x == 0.0 and island._kick_y == 0.0
+        assert island._squish == 1.0
+
+        island.set_agent_active(True)  # dsh 开工：蓝灯 + 弹一下
+        assert island._agent_active is True
+        assert island._status_dot_color().blue() > 200
+        island.set_agent_active(False)
+        assert island._status_dot_color().green() > 200  # 回到可见绿灯
+    finally:
+        island.hide()
+        island.deleteLater()
+
+
+def test_event_bounce_is_positional_with_squish(tmp_path):
+    """事件动效 = 整数位移下压回弹 + 表面轻压 + 微缩放（不再有大幅挤压变形）。"""
+    _qapp()
+    island = _island(tmp_path)
+    try:
+        island.show()
+        island.notify_event("reply")
+        assert island._kick_y > 0.0  # 下压
+        assert island._squish_v < 0.0  # 表面轻压（史莱姆形变）
+        assert abs(island._scale_v) < 0.5  # 缩放只做辅助（旧版 5.0 会糊文字）
+        island._finish_animations()
+        assert island._debug_state()["animating"] is False
+    finally:
+        island.hide()
+        island.deleteLater()
+
+
+def test_expand_card_emits_signal(tmp_path):
+    """卡片展开发出 card_expanded（AppShell 借此静默刷新余额）。"""
+    _qapp()
+    island = _island(tmp_path)
+    try:
+        island.show()
+        hits = []
+        island.card_expanded.connect(lambda: hits.append(1))
+        island.expand_card()
+        island._finish_animations()
+        assert hits == [1]
+        island.collapse_card()
+        assert hits == [1]  # 收起不发
+    finally:
+        island.hide()
+        island.deleteLater()
+
+
+def test_appearance_opacity_and_accent(tmp_path):
+    """不透明度与主题色进入调色板；非法值回退默认。"""
+    _qapp()
+    island = _island(tmp_path, opacity=0.5, accent="pink")
+    try:
+        bg, _primary, _secondary = island._style_palette()
+        assert bg.alpha() == round(235 * 0.5)
+        assert island._accent_color().name() == "#ff7ab8"
+        island._cfg = dict(island._cfg, opacity="bogus", accent="not-a-color")
+        assert island._opacity() == 1.0
+        assert island._accent_color().name() == "#40b8ff"
+    finally:
+        island.hide()
+        island.deleteLater()
+
+
+# ------------------------------------------------------------ 配置清洗
+def test_config_cleans_new_island_keys(tmp_path):
+    cfg = Config(base=tmp_path)
+    cfg.set("dynamic_island", {
+        "click_action": "bogus", "event_effects": 0, "edge_dock": 1,
+        "dock_edge": "celling", "enabled": True,
+    })
+    cleaned = cfg.get("dynamic_island")
+    assert cleaned["click_action"] == "expand"  # 非法值回默认
+    assert cleaned["event_effects"] is False
+    assert cleaned["edge_dock"] is True
+    assert cleaned["dock_edge"] == "none"  # 非法边回 none
+
+    cfg.set("dynamic_island", {
+        "click_action": "toggle_pet", "dock_edge": "left", "enabled": True,
+    })
+    cleaned = cfg.get("dynamic_island")
+    assert cleaned["click_action"] == "toggle_pet"
+    assert cleaned["dock_edge"] == "left"
+
+    # 外观新键：opacity 钳位、accent 白名单（acrylic 已下线，非法风格回默认）
+    cfg.set("dynamic_island", {
+        "style": "glass", "opacity": 0.55, "accent": "purple", "enabled": True,
+    })
+    cleaned = cfg.get("dynamic_island")
+    assert cleaned["style"] == "glass"
+    assert cleaned["opacity"] == 0.55
+    assert cleaned["accent"] == "purple"
+    cfg.set("dynamic_island", {
+        "style": "acrylic", "opacity": 9.9, "accent": "gold", "enabled": True,
+    })
+    cleaned = cfg.get("dynamic_island")
+    assert cleaned["style"] == "dark"     # 已下线的风格回默认
+    assert cleaned["opacity"] == 1.0      # 超界钳到 1.0
+    assert cleaned["accent"] == "blue"    # 非法色回默认
+
+
+# ------------------------------------------------------------ 位置（脏坐标）
+def test_config_cleans_dirty_island_coordinates(tmp_path):
+    """x/y 必须是**有限**且在 ±100000 内的数：脏值一律回 None（= 自动定位）。
+
+    合法性判据来自消费方式（``_apply_position`` 的 ``QPoint(int(x), int(y))``）：
+    JSON 允许的 ``10**100`` 让 int() 抛 OverflowError、``NaN`` 抛 ValueError、
+    ``±Infinity`` 抛 OverflowError——非法值必须在配置层就归一为 None，而不是把
+    应用创建路径打断（手改配置 / 跨版本回滚 / 外部工具写盘都可能绕过界面）。
+    """
+    cfg = Config(base=tmp_path)
+    dirty = [10 ** 100, float("nan"), float("inf"), -float("inf"),
+             100001, -100001, "400", [1, 2], True, None]
+    for value in dirty:
+        cfg.set("dynamic_island", {"enabled": True, "x": value, "y": value})
+        cleaned = cfg.get("dynamic_island")
+        assert cleaned["x"] is None, f"x={value!r} 必须被清洗成 None"
+        assert cleaned["y"] is None, f"y={value!r} 必须被清洗成 None"
+    # 合法值（含 0 与两个边界）原样保留，落盘重载后仍是合法值
+    for value in (0, 400, -400, 100000, -100000, 12.5):
+        cfg.set("dynamic_island", {"enabled": True, "x": value, "y": value})
+        cleaned = cfg.get("dynamic_island")
+        assert cleaned["x"] == value, f"x={value!r} 被误清洗"
+        assert cleaned["y"] == value, f"y={value!r} 被误清洗"
+    cfg.save()
+    assert Config(base=tmp_path).get("dynamic_island")["x"] == 12.5
+
+
+def test_island_survives_dirty_stored_coordinates(tmp_path):
+    """存储里的脏坐标（10**100 / NaN / ±Infinity）：构造不炸，落默认位置。
+
+    配置清洗是第一道闸，消费侧不能只依赖它——这里直接改内存里的岛配置，
+    模拟「没走清洗」的值（手改配置、外部工具写盘、回滚到旧数据）。
+    修复前 ``_apply_position`` 只查 isinstance(int/float) 就 ``QPoint(int(x),
+    int(y))``：10**100 抛 OverflowError、NaN 抛 ValueError、±inf 抛 OverflowError，
+    整条应用创建路径中断；合法字符串/列表坐标的既有回退分支也走不到。
+    """
+    _qapp()
+    avail = _avail()
+    for dirty in (10 ** 100, float("nan"), float("inf"), -float("inf"), 10 ** 6):
+        cfg = Config(base=tmp_path)
+        cfg.set("dynamic_island", {"enabled": True, "x": 400, "y": 300})
+        cfg.data["dynamic_island"]["x"] = dirty     # 绕过清洗层
+        cfg.data["dynamic_island"]["y"] = dirty
+        island = DynamicIsland(cfg)
+        try:
+            expected = QPoint(avail.right() - island.width() - _EDGE_MARGIN,
+                              avail.top() + _EDGE_MARGIN)
+            assert island.pos() == expected, \
+                f"x=y={dirty!r} 未落默认位置：{island.pos()} != {expected}"
+        finally:
+            island.hide()
+            island.deleteLater()
+
+
+def test_island_restores_legal_stored_coordinates(tmp_path):
+    """合法坐标照常恢复（非回归：清洗与消费两道闸都不改正常语义）。"""
+    _qapp()
+    island = _island(tmp_path, x=400, y=300)
+    try:
+        assert island.pos() == QPoint(400, 300)
+    finally:
+        island.hide()
+        island.deleteLater()
+
+
+def test_expanded_mode_disables_window_transform(tmp_path):
+    """展开卡片态禁用整窗变换（截边回归）：悬停不放大、单击展开后目标归零、
+    kick 平移参与不到 paint（展开态 paintEvent 冒烟不炸）。"""
+    _qapp()
+    island = _island(tmp_path)
+    try:
+        island.show()
+        # 悬停（收起态）会抬放大目标
+        island.enterEvent(None)
+        assert island._hover_scale_target == 1.02
+        # 单击展开：目标必须拉回 1.0（否则展开后仍按 1.02 缩放，贴边底板被截）
+        island.expand_card()
+        assert island._mode == "expanded"
+        assert island._hover_scale_target == 1.0
+        # 展开态再次悬停：不再抬目标
+        island.enterEvent(None)
+        assert island._hover_scale_target == 1.0
+        # 展开态 + 待播放的 kick：paintEvent 跳过整窗平移（冒烟不炸）
+        island._bounce(4.0)
+        island.repaint()
+        island.update()
+        QApplication.processEvents()
+        # 收起后悬停放大恢复
+        island.collapse_card()
+        island.enterEvent(None)
+        assert island._hover_scale_target == 1.02
+    finally:
+        island.hide()
+        island.deleteLater()
+
+
+def test_expanded_mode_freezes_squish(tmp_path):
+    """展开卡片态冻结史莱姆形变：squish 打到下限也不鼓出窗口（截边回归）。"""
+    _qapp()
+    island = _island(tmp_path)
+    try:
+        island.show()
+        island.expand_card()
+        island._squish = 0.85  # 形变下限（bump 最大冲击）
+        rect, _radius = island._squished_capsule_rect()
+        assert rect.width() <= island.width() - 2 * 6 + 0.01  # 不超内缩边界
+        assert rect.width() <= island.width()
+        # 收起态形变恢复（对照）
+        island.collapse_card()
+        island._squish = 0.85
+        rect2, _ = island._squished_capsule_rect()
+        assert rect2.width() > rect.width()
+    finally:
+        island.hide()
+        island.deleteLater()
+
+
+class _PaintingIsland(DynamicIsland):
+    """真实岛 + 真实 paintEvent 计数（不 mock 产品对象、不拦 update 调度）。"""
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.paints = 0
+
+    def paintEvent(self, event):  # noqa: N802 (Qt 命名)
+        self.paints += 1
+        super().paintEvent(event)
+
+
+def _spin_event_loop(ms: int) -> None:
+    """真事件循环跑 ms 毫秒（让真定时器/真 paintEvent 自然发生），不 sleep 赌时序。"""
+    loop = QEventLoop()
+    QTimer.singleShot(ms, loop.quit)
+    loop.exec()
+
+
+def test_expanded_card_bump_does_not_spin_dead_repaints(tmp_path):
+    """展开卡片态受击/事件弹跳：不得拉起 60fps 整窗重绘空转。
+
+    展开态 paintEvent 丢弃 kick/tilt/scale/呼吸、``_squished_capsule_rect``
+    冻结 squish（见上面两个截边用例）——这些通道收敛到什么值都不改变像素，
+    却仍被 ``_animating()`` 判为"动画活跃"：每次 bump（岛被宠撞）/余额弹跳
+    都在半透明顶层窗上白跑 ~1s 的 60fps 重绘（实机每帧一次窗口合成）。
+    """
+    _qapp()
+    cfg = Config(base=tmp_path)
+    cfg.set("dynamic_island", {
+        "enabled": True, "show_icon": True, "show_name": True,
+        "show_info": True, "info_mode": "time", "custom_text": "",
+        "show_status": True, "style": "dark", "x": 400, "y": 300,
+    })
+    island = _PaintingIsland(cfg)
+    try:
+        island.show()
+        island.expand_card()
+        _drive_anim(island)  # 几何动画按真定时器节奏跑到位（不 sleep）
+        assert island._mode == "expanded"
+        assert not island._anim_timer.isActive()  # 稳态：无动画在跑
+
+        island.bump(2.0, 1.0, 0.0)  # 岛被宠撞（碰撞桥 bump 入口同路径）
+        for _ in range(5):          # 真动画 tick 节奏（dt=50ms/帧）
+            if not island._anim_timer.isActive():
+                break
+            island._anim_last = time.monotonic() - 0.05
+            island._on_anim_tick()
+        assert island._anim_timer.isActive() is False, \
+            "展开态 bump 拉起了 60fps 整窗重绘空转（像素零变化）"
+        assert island._kick_x == 0.0 and island._kick_y == 0.0  # 弹簧已复位
+        assert island._squish == 1.0
+
+        # 像素后果（真事件循环 + 真 paintEvent）：展开态受击后不再逐帧重绘
+        island.paints = 0
+        _spin_event_loop(200)
+        assert island.paints <= 3, f"展开态空转重绘 {island.paints} 次/200ms"
+
+        # 对照组：收起态同样 bump 必须照常播动画（不得连坐正常路径）
+        island.collapse_card()
+        _drive_anim(island)
+        island.paints = 0
+        island.bump(2.0, 1.0, 0.0)
+        for _ in range(5):
+            if not island._anim_timer.isActive():
+                break
+            island._anim_last = time.monotonic() - 0.05
+            island._on_anim_tick()
+        assert island._anim_timer.isActive() is True, "收起态 bump 的动画被误杀"
+        _spin_event_loop(200)
+        assert island.paints >= 3, f"收起态受击未重绘（{island.paints} 次/200ms）"
+    finally:
+        island.hide()
+        island.deleteLater()
+
+
+def test_edge_dock_off_resets_docked_island(tmp_path):
+    """关闭「靠边半隐藏」时已停靠的岛复位回正常形态（不再卡 16px 细条）。"""
+    _qapp()
+    island = _island(tmp_path, edge_dock=True, dock_edge="left")
+    try:
+        island.show()
+        island._apply_position()
+        assert island._mode == "docked"
+        assert island.dock_edge == "left"
+        # 设置里关掉开关（dock_edge 键仍保留），刷新配置
+        data = dict(island._cfg)
+        data["edge_dock"] = False
+        island.config.set("dynamic_island", data)
+        island.refresh_from_config()
+        assert island._mode == "normal"
+        assert island.dock_edge == "none"  # 读取处被总开关拦截
+        assert not island._hover_peek
+        # 开关再开：存储的边恢复
+        data["edge_dock"] = True
+        island.config.set("dynamic_island", data)
+        island.refresh_from_config()
+        assert island.dock_edge == "left"
+    finally:
+        island.hide()
+        island.deleteLater()
+
+
+def test_drag_start_clears_geometry_animation(tmp_path):
+    """拖拽起手清掉进行中的几何动画目标（滑出动画不再和拖拽抢窗口）。"""
+    _qapp()
+    island = _island(tmp_path)
+    try:
+        island.show()
+        island._animate_to(QRect(100, 100, 260, 44))  # 模拟进行中的几何动画
+        assert island._geo_to is not None
+        # 模拟按下并拖动超过阈值
+        press = QPoint(island.x() + 10, island.y() + 10)
+        island.mousePressEvent(QMouseEvent(
+            QEvent.Type.MouseButtonPress, QPointF(10, 10),
+            QPointF(press), Qt.MouseButton.LeftButton,
+            Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier))
+        island.mouseMoveEvent(QMouseEvent(
+            QEvent.Type.MouseMove, QPointF(60, 10),
+            QPointF(press + QPoint(50, 0)), Qt.MouseButton.LeftButton,
+            Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier))
+        assert island._dragging
+        assert island._geo_to is None
+        assert island._geo_from is None
+    finally:
+        island.hide()
+        island.deleteLater()
+
+
+def test_apply_position_does_not_hijack_expanded_card(tmp_path):
+    """展开卡片态不被停靠劫持（设置保存触发 _apply_position 时 mode 保持
+    expanded、卡片不收起）；收起后按 dock_edge 正常停靠。"""
+    _qapp()
+    island = _island(tmp_path, edge_dock=True, dock_edge="left")
+    try:
+        island.show()
+        island.expand_card()
+        assert island._mode == "expanded"
+        island._apply_position()  # 保存设置的触发路径
+        assert island._mode == "expanded"  # 不被劫持成 docked
+        assert island._card_box.isVisible()
+        # 收起后按 dock_edge 正常停靠（collapse_card 的分支）
+        island.collapse_card()
+        assert island._mode == "docked"
+    finally:
+        island.hide()
+        island.deleteLater()
+
+
+# ------------------------------------------------------------ 图标图片化
+def _solid_pixmap(color: str = "#ff0000", size: int = 64) -> QPixmap:
+    pm = QPixmap(size, size)
+    pm.fill(QColor(color))
+    return pm
+
+
+def test_default_icon_is_auto(tmp_path):
+    """默认图标是 auto（鱼本体头像/图片路径），不再是 emoji 🐳。
+
+    首次 emoji 绘制会触发 DirectWrite 彩色字体栈一次性 +33.6MB 私有内存，
+    默认值必须避开它。
+    """
+    cfg = Config(base=tmp_path)
+    assert cfg.get("dynamic_island")["icon"] == "auto"
+
+
+def test_auto_icon_uses_provider_pixmap(tmp_path):
+    """auto 模式：provider 的头像真的画进底圈，_icon_pixmap 返回同一张图。"""
+    _qapp()
+    island = _island(tmp_path, icon="auto")
+    try:
+        island.show()
+        pm = _solid_pixmap()
+        island.set_icon_provider(lambda: pm)
+        assert island._icon_pixmap() is pm
+        content = island._content_cache()
+        assert not content.isNull()
+        dpr = island.devicePixelRatioF()
+        img = content.toImage().convertToFormat(QImage.Format.Format_ARGB32)
+        # 图标槽中心（26px 底圈圆心）必须被红色头像盖住
+        cx = round((_CAPSULE_INSET + 13.0 + 13.0) * dpr)
+        cy = round(_CAPSULE_HEIGHT / 2.0 * dpr)
+        center = img.pixelColor(cx, cy)
+        assert center.alpha() > 200 and center.red() > 200, \
+            "auto 模式没把 provider 头像画进底圈"
+    finally:
+        island.hide()
+        island.deleteLater()
+
+
+def test_auto_icon_none_result_is_not_cached(tmp_path):
+    """provider 返回 None（帧未就绪）不得缓存：下次还会再问一次。"""
+    _qapp()
+    island = _island(tmp_path, icon="auto")
+    calls: list[int] = []
+
+    def provider():
+        calls.append(1)
+        return None
+
+    try:
+        island.set_icon_provider(provider)
+        assert island._icon_pixmap() is None
+        assert island._icon_pixmap() is None
+        assert len(calls) == 2, "provider 返回 None 被缓存了，头像永远不会补上"
+        # 没头像时内容层照样出图（只画底圈）
+        content = island._content_cache()
+        assert not content.isNull()
+    finally:
+        island.hide()
+        island.deleteLater()
+
+
+def test_auto_icon_retries_provider_and_repaints_on_refresh(tmp_path):
+    """provider 就绪后（内容层重建路径）头像补上；换形象也走同一条清缓存路径。"""
+    _qapp()
+    island = _island(tmp_path, icon="auto", info_mode="custom", custom_text="占位")
+    state = {"pm": None}
+    try:
+        island.show()
+        island.set_icon_provider(lambda: state["pm"])
+        assert island._icon_pixmap() is None
+        state["pm"] = _solid_pixmap()
+        # 内容层 key 未变 → 仍用旧缓存；refresh_from_config（换形象/设置保存）后重取
+        data = dict(island._cfg)
+        data["custom_text"] = "变了"
+        island.config.set("dynamic_island", data)
+        island.refresh_from_config()
+        assert island._icon_pixmap() is state["pm"]
+        assert island._content_cache() is not None
+    finally:
+        island.hide()
+        island.deleteLater()
+
+
+def test_emoji_icon_mode_keeps_text_path(tmp_path):
+    """emoji 模式行为不变：_icon_text 返回配置字符串，且不走图片路径。"""
+    _qapp()
+    island = _island(tmp_path, icon="🐟")
+    try:
+        assert island._icon_text() == "🐟"
+        assert island._icon_pixmap() is None
+    finally:
+        island.hide()
+        island.deleteLater()
+
+
+def test_img_icon_mode_loads_file_once_and_caches_failure(tmp_path):
+    """img: 模式：文件在则取图并缓存；缺失时失败结果也缓存（免每帧磁盘 IO）。"""
+    _qapp()
+    png = tmp_path / "icon.png"
+    assert _solid_pixmap("#00ff00").save(str(png))
+    island = _island(tmp_path, icon=f"img:{png}")
+    try:
+        first = island._icon_pixmap()
+        assert first is not None and not first.isNull()
+        assert island._icon_pixmap() is first, "img: 成功结果必须缓存"
+
+        island.config.set("dynamic_island", {
+            **dict(island._cfg), "icon": f"img:{tmp_path / 'missing.png'}",
+        })
+        island.refresh_from_config()
+        assert island._icon_pixmap() is None
+        assert island._icon_img_failed is True, "失败结果必须记住"
+    finally:
+        island.hide()
+        island.deleteLater()
+
+
+def test_config_icon_normalization(tmp_path):
+    """icon 归一化：缺省/空 → auto；img: 路径保留（限长 260）；emoji 原样留着。"""
+    cfg = Config(base=tmp_path)
+    cfg.set("dynamic_island", {"enabled": True})
+    assert cfg.get("dynamic_island")["icon"] == "auto"
+
+    cfg.set("dynamic_island", {"enabled": True, "icon": "   "})
+    assert cfg.get("dynamic_island")["icon"] == "auto"
+
+    cfg.set("dynamic_island", {"enabled": True, "icon": "img:C:/pics/fish.png"})
+    assert cfg.get("dynamic_island")["icon"] == "img:C:/pics/fish.png"
+
+    long_path = "img:" + "a" * 400
+    cfg.set("dynamic_island", {"enabled": True, "icon": long_path})
+    assert cfg.get("dynamic_island")["icon"] == long_path[:260]
+
+    # 存量用户配置里的 emoji 视为用户选择，不做迁移
+    cfg.set("dynamic_island", {"enabled": True, "icon": "🐳"})
+    assert cfg.get("dynamic_island")["icon"] == "🐳"
+
+
+def test_click_hidden_pet_without_chat_falls_back_to_card(tmp_path):
+    """纯桌宠版死锁回归（hidden_chat 路由）：
+
+    hidden_chat 开 + 桌宠隐藏 + 本构建无聊天能力 → 单击必须回退展开卡片
+    （卡片的「显示桌宠」是唯一恢复入口），不得路由到不存在的对话气泡
+    ——否则岛无任何反应、桌宠永远回不来。
+    """
+    _qapp()
+    island = _island(tmp_path, hidden_chat=True)
+    try:
+        island.show()
+        island.set_chat_available(False)  # 纯桌宠版：无聊天模块
+        island.set_pet_visible(False)
+        chat_hits, card_hits = [], []
+        island.chat_requested.connect(lambda: chat_hits.append(1))
+        island.card_expanded.connect(lambda: card_hits.append(1))
+        _click(island)
+        island._finish_animations()
+        assert chat_hits == []
+        assert card_hits == [1]
+    finally:
+        island.hide()
+        island.deleteLater()
+
+
+def test_click_hidden_pet_with_chat_requests_bubble(tmp_path):
+    """对照：有聊天能力的构建维持原路由（隐藏 + hidden_chat 开 → 弹气泡）。"""
+    _qapp()
+    island = _island(tmp_path, hidden_chat=True)
+    try:
+        island.show()
+        island.set_chat_available(True)
+        island.set_pet_visible(False)
+        chat_hits, card_hits = [], []
+        island.chat_requested.connect(lambda: chat_hits.append(1))
+        island.card_expanded.connect(lambda: card_hits.append(1))
+        _click(island)
+        island._finish_animations()
+        assert chat_hits == [1]
+        assert card_hits == []
+    finally:
+        island.hide()
+        island.deleteLater()

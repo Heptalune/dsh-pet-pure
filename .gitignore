@@ -1,0 +1,89 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.DS_Store
+
+# 运行时产物
+tmp_appdata/
+tests/_tmp_*/
+
+# 素材：只提交 assets/characters（角色动画），其他 assets 内容不入库
+assets/*
+!assets/characters/
+!assets/characters/**
+assets/thumb/
+assets/videos/
+assets/animations/
+assets/prompt/
+# 帧序列化产物（B 档）：构建期/首跑生成的派生素材，单包 ~150MB 起，不入库
+assets/characters/*/frameseq/
+
+# 点击音效（内置合成 click.wav，随包分发；用户可自定义覆盖）
+!assets/sounds/
+!assets/sounds/**
+
+# 彩蛋弹窗图片池（fun_image_popup 随机取图，随包分发）
+!assets/big_blue_fat_fish/
+!assets/big_blue_fat_fish/**
+
+# Windows 安装包图标（本地生成，入库保证克隆后可构建）
+!assets/icon.ico
+
+# 随包分发的第三方二进制（刻意入库，不是误入的构建产物）：
+# resources/presentmon/ 里的独立控制台程序是游戏帧率段的数据源，上游没有 PyPI 包，
+# 不入库则干净克隆与 CI 构建拿不到它（打包门会因此中止，见
+# scripts/verify_presentmon.py）。来源、版本、sha256 与 MIT 许可文本见
+# THIRD_PARTY_NOTICES.md 第 6 节；这里的目录本身不被任何规则忽略，此段是说明而非白名单。
+#
+# resources/rapidocr_models/ 同理：三个 ONNX 模型（共 31.6 MB）是「截图提取文字」
+# 的本地 OCR 权重，pip 依赖（rapidocr）虽然自带同一批文件，但产品只从随包目录加载，
+# 不入库则干净克隆/CI 构建的包没有模型（打包门 scripts/verify_rapidocr_models.py
+# 会中止）。来源、sha256 与 Apache-2.0 许可文本见 THIRD_PARTY_NOTICES.md 第 7 节。
+
+# PyInstaller 构建产物
+build/
+dist/
+*.spec
+
+# 本地开发文档（不随仓库发布）
+LOG.md
+LOG-INDEX.md
+SPEC.md
+_plan/
+# onedir build artifacts
+dist-onedir/
+build-onedir/
+
+# 构建注入的变体标识（由 scripts/build_onedir.ps1 生成）
+packaging/build_variant.py
+
+# 本地实验目录（含嵌套 git 仓库，不入库）
+.research/
+
+# 聊天背景主题壁纸（聊天背景功能随包分发）
+!assets/chat/
+!assets/chat/**
+
+# 全局忽略 macOS 元数据（置于所有白名单之后，防止被 !** 反向放行）
+**/.DS_Store
+.serena/
+.scratch/
+
+# Node 依赖树：桥接插件为零依赖红线，本地 pnpm install 残留不许入库——
+# 否则原地 import 门禁蹭到它假绿，且 PyInstaller --add-data 会把 junction 垃圾带进产物
+node_modules/
+dist-onedir-alt/
+
+# Android tools, signing material, and generated outputs
+android/.gradle/
+android/.kotlin/
+android/hs_err_pid*.log
+android/local.properties
+android/**/build/
+*.keystore
+*.jks
+dist-android/
+
+# 素材包构建产物（发布门输出，发布到 Release 后即可删）
+dist-packs/

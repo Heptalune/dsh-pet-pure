@@ -1,0 +1,26 @@
+# 纯桌宠变体（scripts/build_pure.ps1）的构建与运行依赖。
+#
+# 与 requirements.txt 的差异（全部是**功能模块专用**依赖，纯桌宠变体不装）：
+# - keyring / pywin32-ctypes：仅 AI 对话的 API Key 安全存储用（pet.chat）。
+# - pycaw：仅音乐模块的播放设备检测（pet/music/detect.py，懒加载）。
+# - lunar-python：仅节日提醒的农历/节气换算（pet/festival）。
+# - edge-tts：仅语音报时/TTS（pet/voice，懒加载）。
+# - winrt-* / psutil：仅歌词显示（SMTC）与灵动岛/音乐指标。
+# - rapidocr / onnxruntime / omegaconf / opencv-python-headless / numpy：
+#   仅本地 OCR 识屏（pet/screen_capture，独立子进程）。
+# - certifi：仅 chat provider 的 HTTPS 证书校验（纯变体无网络请求面，
+#   PyInstaller 侧也不再 --collect-all certifi）。
+#
+# 保留项（桌宠本体必需）：
+# - PySide6：Qt GUI 框架（窗口/菜单/设置/动画渲染）。
+# - imageio-ffmpeg：**动画播放引擎**——其自带静态 ffmpeg 把 VP9 alpha WebM
+#   解码成 RGBA 帧（pet/webm_clip.py），也是帧序列供给的转换器。
+# - Pillow：帧序列白底反解（pet/frameseq_provision.py 的 unblend v6）与
+#   图标生成。
+# - tzdata：Windows 上 zoneinfo 的时区数据兜底（体积极小，保险起见保留）。
+# - pyinstaller：仅构建期使用。
+PySide6>=6.5
+imageio-ffmpeg>=0.6
+Pillow>=10.3
+tzdata>=2024.1
+pyinstaller>=6.10

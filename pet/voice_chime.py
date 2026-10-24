@@ -1,0 +1,621 @@
+# -*- coding: utf-8 -*-
+"""语音报时：纯逻辑决策层（零 Qt、零 edge_tts）。
+
+模块顶部为纯函数与纯数据，可在无 GUI 环境直接导入测试；语音合成与播放
+由 pet/voice_chime_service.py 承担（后台线程 + QtMultimedia）。
+
+职责：
+- 配置默认值与逐项清洗（与 config.py 平铺键对应）；
+- 报时调度判定（整点 / 每30分钟 / 每15分钟 / 每5分钟 / 每分钟 / 自定义
+  时间点）与“距下一报时点秒数”计算；
+- 报时文本组装：语音口播（中文数字，供 TTS 与缓存键）与气泡展示（阿拉伯数字）
+  两套文本解耦生成；
+- 台词/歌词轮换：每天把库洗成一套新排列（按日期确定性洗牌），日内按序取用；
+- 自定义台词/歌词解析（留空回退内置库）；
+- edge-tts 参数格式化（rate / pitch）。
+"""
+
+from __future__ import annotations
+
+import re
+from datetime import datetime, timedelta
+
+from . import tts
+from .tts import edge as _edge_provider
+from .tts import mimo as _mimo_provider
+from .voice_chime_quotes import CHINESE_QUOTES, ENGLISH_QUOTES
+
+# 调度模式键（设置页 ModernSelect 的 data 与此对应）。
+SCHEDULE_KEYS = (
+    "hourly",  # 整点
+    "every_30",  # 每 30 分钟
+    "every_15",  # 每 15 分钟
+    "every_5",  # 每 5 分钟
+    "every_minute",  # 每分钟
+    "custom",  # 自定义时间点
+)
+SCHEDULE_LABELS = {
+    "hourly": "整点报时",
+    "every_30": "每 30 分钟",
+    "every_15": "每 15 分钟",
+    "every_5": "每 5 分钟",
+    "every_minute": "每分钟",
+    "custom": "自定义时间点",
+}
+
+DEFAULT_VOICE = "zh-CN-XiaoxiaoNeural"
+DEFAULT_RATE = 0  # 语速偏移（%），edge-tts 范围约 -100 ~ +100
+DEFAULT_PITCH = 0  # 音调偏移（Hz），edge-tts 范围约 -50 ~ +50
+DEFAULT_VOLUME = 80  # 播放音量（0-100）
+DEFAULT_SHOW_BUBBLE = True  # 报时气泡开关
+DEFAULT_SHOW_QUOTE = True  # 台词/歌词开关
+
+# 台词/歌词轮换：**每天一整套新排列**。以「日期序数」为种子把库确定性洗牌
+# （Fisher–Yates），当天任意时刻调用得到同一个排列；日内按报时次序从排列头部
+# 往下取、用尽回环，于是同一天里每次报时都是不同句子，第二天整套顺序换新。
+#
+# 为什么不是「每 8 小时换一批」：旧实现里批次 =（日期序数 × 3 + 当日第几段）% 3，
+# 乘 3 与取模 3 恰好对消 —— 批次只由「当天第几段」决定，日期被自己抵消掉，于是
+# 每天同一时刻永远是同一句（用户反馈「几乎每天都是一样的台词」即由此而来）。
+_MAX_CUSTOM_QUOTE_LEN = 120  # 自定义单条台词长度上限（超长截断，防误粘长文）
+
+# ---------------------------------------------------------------- 合成后端
+# 后端清单/标签来自注册表（pet/tts）：新增 provider 后这里自动跟着变，不需要改本文件。
+# 本模块仍是纯逻辑层：只看「后端名 + 参数 + 合成计划」，不 import 任何网络或 TTS 库——
+# 真正的合成在 provider.synth() 里，由 pet/voice_chime_service.py 的后台线程调用。
+BACKEND_EDGE = _edge_provider.PROVIDER.id
+BACKEND_MIMO = _mimo_provider.PROVIDER.id
+BACKENDS: tuple[str, ...] = tts.provider_ids()
+BACKEND_LABELS = tts.labels()
+# 默认走 edge（2026-10-13 改，原为小米 MiMo）：它免凭据，陌生人开箱即有声；mimo / doubao
+# 要用户自备 API Key，拿它们当默认等于新装即静音。失败时按 voice_chime_tts_fallback
+# 回退带 is_fallback 的后端。config.py 的 DEFAULTS 与本常量必须一致——它是「配置缺键/
+# 值非法」时的落点，两者分叉会让「默认」出现两种含义。
+DEFAULT_BACKEND = BACKEND_EDGE
+DEFAULT_TTS_FALLBACK = True
+
+# MiMo 的默认值由 provider 自己声明（设置页占位与「缺键回落」共用同一份）。
+DEFAULT_MIMO_MODEL = _mimo_provider.DEFAULT_MIMO_MODEL
+DEFAULT_MIMO_VOICE = _mimo_provider.DEFAULT_MIMO_VOICE
+DEFAULT_MIMO_STYLE = _mimo_provider.DEFAULT_MIMO_STYLE
+
+# MiMo 的历史公开符号：合成搬进 ``pet/tts/mimo.py`` 之后，这些名字仍从本模块导出，
+# 既有调用点与用例不必改 import 路径（真正的定义只有一份，不会分叉）。
+MIMO_BASE_URL = _mimo_provider.MIMO_BASE_URL
+MIMO_CHAT_PATH = _mimo_provider.MIMO_CHAT_PATH
+MIMO_MODEL = _mimo_provider.MIMO_MODEL
+MIMO_MODEL_VOICE_DESIGN = _mimo_provider.MIMO_MODEL_VOICE_DESIGN
+MIMO_MODELS = _mimo_provider.MIMO_MODELS
+MIMO_VOICE_OPTIONS = _mimo_provider.MIMO_VOICE_OPTIONS
+MIMO_STYLE_MAX_LEN = _mimo_provider.MIMO_STYLE_MAX_LEN
+MIMO_AUDIO_FORMAT = _mimo_provider.MIMO_AUDIO_FORMAT
+MIMO_TIMEOUT_S = _mimo_provider.MIMO_TIMEOUT_S
+clean_mimo_model = _mimo_provider.clean_mimo_model
+clean_mimo_voice = _mimo_provider.clean_mimo_voice
+clean_mimo_style = _mimo_provider.clean_mimo_style
+mimo_messages = _mimo_provider.mimo_messages
+mimo_payload = _mimo_provider.mimo_payload
+parse_mimo_audio = _mimo_provider.parse_mimo_audio
+
+# edge-tts 中英文音色下拉列表（value=音色名，label=友好中文标签）。
+# 2026-09-22 按微软在线音色表（``edge_tts.list_voices()``，322 款）重建：老清单里
+# 有 10 款中文音色已被下架（晓涵/晓辰/晓梦/晓墨/晓秋/晓睿/晓双/晓萱/晓颜/晓悠），
+# 留着它们只会让用户选到「合成没有声音」；这里同时补上了在线的新音色。
+# 服务层另有「配置音色不在在线表里 → 自动改用默认音色并提示」的兜底（见
+# voice_chime_service.resolve_voice），所以这份清单是快照而非唯一真相。
+VOICE_OPTIONS: tuple[tuple[str, str], ...] = (
+    ("zh-CN-XiaoxiaoNeural", "晓晓（女 · 自然）"),
+    ("zh-CN-XiaoyiNeural", "晓伊（女 · 活泼）"),
+    ("zh-CN-YunjianNeural", "云健（男 · 浑厚）"),
+    ("zh-CN-YunxiNeural", "云希（男 · 阳光）"),
+    ("zh-CN-YunxiaNeural", "云夏（男 · 少年）"),
+    ("zh-CN-YunyangNeural", "云扬（男 · 新闻播报）"),
+    ("zh-CN-liaoning-XiaobeiNeural", "晓北（女 · 东北腔）"),
+    ("zh-CN-shaanxi-XiaoniNeural", "晓妮（女 · 陕西腔）"),
+    ("zh-TW-HsiaoChenNeural", "曉臻（女 · 台灣腔）"),
+    ("zh-TW-HsiaoYuNeural", "曉雨（女 · 台灣腔）"),
+    ("zh-TW-YunJheNeural", "雲哲（男 · 台灣腔）"),
+    ("zh-HK-HiuGaaiNeural", "曉佳（女 · 粵語）"),
+    ("zh-HK-HiuMaanNeural", "曉文（女 · 粵語）"),
+    ("zh-HK-WanLungNeural", "雲龍（男 · 粵語）"),
+    ("en-US-AriaNeural", "Aria（英文女声 · 自然）"),
+    ("en-US-JennyNeural", "Jenny（英文女声 · 甜美）"),
+    ("en-US-MichelleNeural", "Michelle（英文女声 · 温暖）"),
+    ("en-US-AnaNeural", "Ana（英文女声 · 童声）"),
+    ("en-US-AvaNeural", "Ava（英文女声 · 新一代）"),
+    ("en-US-EmmaNeural", "Emma（英文女声 · 新一代）"),
+    ("en-US-GuyNeural", "Guy（英文男声 · 沉稳）"),
+    ("en-US-ChristopherNeural", "Christopher（英文男声 · 沉稳）"),
+    ("en-US-EricNeural", "Eric（英文男声 · 年轻）"),
+    ("en-US-RogerNeural", "Roger（英文男声 · 成熟）"),
+    ("en-US-AndrewNeural", "Andrew（英文男声 · 新一代）"),
+    ("en-US-BrianNeural", "Brian（英文男声 · 新一代）"),
+    ("en-US-SteffanNeural", "Steffan（英文男声 · 沉稳）"),
+    ("en-US-AvaMultilingualNeural", "Ava（多语言女声）"),
+    ("en-US-EmmaMultilingualNeural", "Emma（多语言女声）"),
+    ("en-US-AndrewMultilingualNeural", "Andrew（多语言男声）"),
+    ("en-US-BrianMultilingualNeural", "Brian（多语言男声）"),
+    ("en-GB-SoniaNeural", "Sonia（英音女声）"),
+    ("en-GB-RyanNeural", "Ryan（英音男声）"),
+    ("en-GB-LibbyNeural", "Libby（英音女声）"),
+    ("en-GB-MaisieNeural", "Maisie（英音女童）"),
+    ("en-GB-ThomasNeural", "Thomas（英音男声）"),
+)
+
+#: 2026-09-22 实测已从微软在线音色表下线的音色（老清单里的 10 款）。只用于把
+#: 「你配的那个音色已经没了」说成人话——用户看到的应当是「晓涵」而不是音色 id。
+DEPRECATED_VOICE_LABELS = {
+    "zh-CN-XiaochenNeural": "晓辰",
+    "zh-CN-XiaohanNeural": "晓涵",
+    "zh-CN-XiaomengNeural": "晓梦",
+    "zh-CN-XiaomoNeural": "晓墨",
+    "zh-CN-XiaoqiuNeural": "晓秋",
+    "zh-CN-XiaoruiNeural": "晓睿",
+    "zh-CN-XiaoshuangNeural": "晓双",
+    "zh-CN-XiaoxuanNeural": "晓萱",
+    "zh-CN-XiaoyanNeural": "晓颜",
+    "zh-CN-XiaoyouNeural": "晓悠",
+}
+
+
+def voice_label(value) -> str:
+    """音色的中文名：内置清单 → 已下线映射 → 原样返回 id。给用户看的提示用它。"""
+    voice = str(value or "").strip()
+    for name, label in VOICE_OPTIONS:
+        if name == voice:
+            return label.split("（")[0]
+    return DEPRECATED_VOICE_LABELS.get(voice, voice)
+
+_CUSTOM_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
+_RATE_RE = re.compile(r"^[+-]?\d+$")
+_PITCH_RE = re.compile(r"^[+-]?\d+$")
+
+# 中文时刻文本（12 小时制）。
+_HOUR_CN = (
+    "十二",
+    "一",
+    "二",
+    "三",
+    "四",
+    "五",
+    "六",
+    "七",
+    "八",
+    "九",
+    "十",
+    "十一",
+)
+
+
+def default_chime_config() -> dict:
+    """语音报时配置默认值（config.py 顶层平铺键的镜像）。
+
+    合成后端那几项由 provider 自己声明（``pet/tts`` 的 ``fields``），这里遍历生成——
+    接入新 TTS 不需要改本函数，也不会漏登记。
+    """
+    config = {
+        "voice_chime_enabled": False,
+        "voice_chime_schedule": "hourly",
+        "voice_chime_custom_times": "",
+        "voice_chime_volume": DEFAULT_VOLUME,
+        "voice_chime_show_bubble": DEFAULT_SHOW_BUBBLE,
+        "voice_chime_show_quote": DEFAULT_SHOW_QUOTE,
+        "voice_chime_custom_quotes_zh": "",  # 自定义中文台词/歌词（一行一条，留空用内置库）
+        "voice_chime_custom_quotes_en": "",  # 自定义英文台词/歌词（一行一条，留空用内置库）
+        "voice_chime_tts_backend": DEFAULT_BACKEND,  # 主后端（注册表里的 provider id）
+        "voice_chime_tts_fallback": DEFAULT_TTS_FALLBACK,  # 主后端失败自动回退后备后端
+    }
+    for provider in tts.providers():
+        for spec in provider.fields:
+            if spec.kind == "secret":
+                continue  # 凭据存系统钥匙串，不进 config
+            config[spec.key] = spec.default
+    return config
+
+
+def clean_flag(value, default: bool = True) -> bool:
+    """清洗布尔开关：JSON bool 原样返回，字符串按常见真值解析，非法回落默认。"""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    text = str(value).strip().lower()
+    if text in ("1", "true", "yes", "on", "开", "开启"):
+        return True
+    if text in ("0", "false", "no", "off", "关", "关闭"):
+        return False
+    return default
+
+
+def clean_backend(value) -> str:
+    """清洗合成后端 id：必须是已注册的 provider，非法值回落默认后端。"""
+    text = str(value or "").strip().lower()
+    return text if text in tts.provider_ids() else DEFAULT_BACKEND
+
+
+def synth_ext(backend) -> str:
+    """该后端产物的扩展名（缓存文件名用）：由 provider 的合成计划给出。"""
+    provider = tts.get(clean_backend(backend))
+    if provider is None:
+        return "mp3"
+    return str(provider.plan(provider.values({})).get("ext") or "mp3")
+
+
+def synth_attempts(cfg: dict, secrets: dict | None = None) -> tuple[tts.TtsAttempt, ...]:
+    """按配置给出合成尝试序列（主后端优先，再回退带 ``is_fallback`` 的后端）。
+
+    每项是 :class:`pet.tts.TtsAttempt`（``provider`` / ``values`` / ``plan``）。
+    纯函数：不探测环境、不读凭据——「现在能不能用」由 ``provider.availability`` 判定，
+    密钥由调用方经 ``secrets[provider_id][字段名]`` 注入，因此单测不需要网络与钥匙串。
+    """
+    backend = clean_backend(cfg.get("backend", DEFAULT_BACKEND))
+    order = [backend]
+    if clean_flag(cfg.get("fallback", DEFAULT_TTS_FALLBACK), DEFAULT_TTS_FALLBACK):
+        order.extend(tts.fallback_ids(exclude=backend))
+    values_map = cfg.get("providers") or {}
+    secret_map = secrets or {}
+    attempts: list[tts.TtsAttempt] = []
+    for provider_id in order:
+        provider = tts.get(provider_id)
+        if provider is None:
+            continue
+        values = dict(values_map.get(provider_id) or provider.values({}))
+        injected = secret_map.get(provider_id) or {}
+        for spec in tts.secret_fields(provider):
+            values[spec.name] = str(injected.get(spec.name) or "")
+        attempts.append(
+            tts.TtsAttempt(provider=provider_id, values=values, plan=provider.plan(values))
+        )
+    return tuple(attempts)
+
+
+def clean_schedule(value) -> str:
+    """清洗调度模式；非法回落整点。"""
+    text = str(value or "").strip()
+    return text if text in SCHEDULE_KEYS else "hourly"
+
+
+def clean_custom_times(value) -> frozenset[str]:
+    """清洗自定义时间点：逗号/空格/分号分隔的 HH:MM，非法项丢弃。"""
+    text = str(value or "").strip()
+    parts = re.split(r"[,，;；\s]+", text)
+    times: set[str] = set()
+    for part in parts:
+        part = part.strip()
+        match = _CUSTOM_RE.match(part)
+        if match:
+            times.add(f"{int(match.group(1)):02d}:{match.group(2)}")
+    return frozenset(times)
+
+
+def clean_voice(value) -> str:
+    """清洗音色名：仅保留可见字符，超长截断。"""
+    text = str(value or "").strip()
+    return text[:64] if text else DEFAULT_VOICE
+
+
+def clean_custom_quotes(value) -> tuple[str, ...]:
+    """清洗自定义台词/歌词：按行拆分（一行一条），去空行/去重/保序。
+
+    兼容设置页传来的多行字符串（``\\n`` / ``\\r\\n`` / ``\\r``）与已是
+    序列的配置值；去除控制字符并按 ``_MAX_CUSTOM_QUOTE_LEN`` 截断单条，
+    保证进入 TTS 的文本干净。返回空元组表示“未自定义”，调用方回退内置库。
+    """
+    if value is None:
+        return ()
+    if isinstance(value, (tuple, list, set)):
+        raw_lines = [str(item) for item in value]
+    else:
+        raw_lines = re.split(r"\r\n|\r|\n", str(value))
+    quotes: list[str] = []
+    for line in raw_lines:
+        text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", line).strip()
+        if not text:
+            continue
+        text = text[:_MAX_CUSTOM_QUOTE_LEN].strip()
+        if text and text not in quotes:
+            quotes.append(text)
+    return tuple(quotes)
+
+
+def clean_rate(value) -> int:
+    """清洗语速偏移（%）：钳制到 [-100, 100]。"""
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_RATE
+    return max(-100, min(100, number))
+
+
+def clean_pitch(value) -> int:
+    """清洗音调偏移（Hz）：钳制到 [-50, 50]。"""
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_PITCH
+    return max(-50, min(50, number))
+
+
+def clean_volume(value) -> int:
+    """清洗音量（0-100）。"""
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_VOLUME
+    return max(0, min(100, number))
+
+
+def normalize_chime_config(config) -> dict:
+    """从 config 对象读取并清洗语音报时全部键（config 缺失字段用默认值）。
+
+    ``providers`` 是各后端的字段值表（密钥留空，服务层按需注入）；``voice`` /
+    ``rate`` / ``pitch`` / ``mimo_*`` 是历史平铺键，供既有调用点与设置页读取，
+    值取自同一张表，两套名字不会分叉。
+    """
+    if config is None:
+        config = {}
+    providers: dict[str, dict] = {}
+    for provider in tts.providers():
+        values = provider.values(config)
+        for spec in tts.secret_fields(provider):
+            values[spec.name] = ""  # 凭据不由纯逻辑层读
+        providers[provider.id] = values
+    edge_values = providers.get(BACKEND_EDGE, {})
+    mimo_values = providers.get(BACKEND_MIMO, {})
+    return {
+        "enabled": bool(config.get("voice_chime_enabled", False)),
+        "schedule": clean_schedule(config.get("voice_chime_schedule", "hourly")),
+        "custom_times": clean_custom_times(config.get("voice_chime_custom_times", "")),
+        "volume": clean_volume(config.get("voice_chime_volume", DEFAULT_VOLUME)),
+        "show_bubble": clean_flag(
+            config.get("voice_chime_show_bubble", DEFAULT_SHOW_BUBBLE), DEFAULT_SHOW_BUBBLE
+        ),
+        "show_quote": clean_flag(
+            config.get("voice_chime_show_quote", DEFAULT_SHOW_QUOTE), DEFAULT_SHOW_QUOTE
+        ),
+        "custom_quotes_zh": clean_custom_quotes(config.get("voice_chime_custom_quotes_zh", "")),
+        "custom_quotes_en": clean_custom_quotes(config.get("voice_chime_custom_quotes_en", "")),
+        "backend": clean_backend(config.get("voice_chime_tts_backend", DEFAULT_BACKEND)),
+        "fallback": clean_flag(
+            config.get("voice_chime_tts_fallback", DEFAULT_TTS_FALLBACK), DEFAULT_TTS_FALLBACK
+        ),
+        "providers": providers,
+        # —— 历史平铺键（兼容既有调用点）——
+        "voice": edge_values.get("voice", DEFAULT_VOICE),
+        "rate": edge_values.get("rate", DEFAULT_RATE),
+        "pitch": edge_values.get("pitch", DEFAULT_PITCH),
+        "mimo_model": mimo_values.get("model", DEFAULT_MIMO_MODEL),
+        "mimo_voice": mimo_values.get("voice", DEFAULT_MIMO_VOICE),
+        "mimo_style": mimo_values.get("style", DEFAULT_MIMO_STYLE),
+    }
+
+
+def is_chime_minute(now: datetime, cfg: dict) -> bool:
+    """当前分钟是否命中报时点（cfg 为 normalize_chime_config 的输出）。"""
+    schedule = cfg.get("schedule", "hourly")
+    minute = now.minute
+    if schedule == "hourly":
+        return minute == 0
+    if schedule == "every_30":
+        return minute % 30 == 0
+    if schedule == "every_15":
+        return minute % 15 == 0
+    if schedule == "every_5":
+        return minute % 5 == 0
+    if schedule == "every_minute":
+        return True
+    if schedule == "custom":
+        hhmm = f"{now.hour:02d}:{now.minute:02d}"
+        return hhmm in cfg.get("custom_times", frozenset())
+    return False
+
+
+def next_chime_in_seconds(now: datetime, cfg: dict) -> int:
+    """距下一报时点的秒数（不含当前分钟已过部分，1..3600 或自定义 1..86400）。"""
+    if cfg.get("schedule") == "custom":
+        times = sorted(cfg.get("custom_times", frozenset()))
+        if not times:
+            return 3600 * 24
+        for hhmm in times:
+            hour, minute = (int(part) for part in hhmm.split(":"))
+            candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            if candidate > now:
+                return max(1, int((candidate - now).total_seconds()))
+        first = times[0]
+        hour, minute = (int(part) for part in first.split(":"))
+        tomorrow = (now + timedelta(days=1)).replace(hour=hour, minute=minute, second=0, microsecond=0)
+        return max(1, int((tomorrow - now).total_seconds()))
+    minute = now.minute
+    if cfg.get("schedule") == "every_minute":
+        return 60 - now.second if now.second else 60
+    if cfg.get("schedule") == "hourly":
+        step = 60
+    elif cfg.get("schedule") == "every_30":
+        step = 30
+    elif cfg.get("schedule") == "every_15":
+        step = 15
+    else:  # every_5
+        step = 5
+    next_minute = minute - (minute % step) + step
+    if next_minute >= 60:
+        base = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+    else:
+        base = now.replace(minute=next_minute, second=0, microsecond=0)
+    return max(1, int((base - now).total_seconds()))
+
+
+def chime_slot(now: datetime, cfg: dict) -> str:
+    """当前分钟命中报时点时返回去重槽位（YYYY-MM-DDTHH:MM#模式），否则空串。
+
+    服务用该槽位做幂等盖戳：同一分钟只报一次（防 tick 重复触发）。
+    """
+    if not is_chime_minute(now, cfg):
+        return ""
+    return f"{now.strftime('%Y-%m-%dT%H:%M')}#{cfg.get('schedule', 'hourly')}"
+
+
+def _period_cn(hour: int) -> str:
+    """时段前缀；入参是 24 小时制的 hour（0-23），不是 12 小时制。"""
+    return "凌晨" if hour < 5 else "早上" if hour < 9 else "上午" if hour < 12 else ("中午" if hour == 12 else "下午" if hour < 18 else "晚上")
+
+
+def build_chime_text(now: datetime, cfg: dict) -> str:
+    """组装报时文本：中文口播“现在是上午九点整 / 现在上午九点05分”。
+
+    分钟用两位数字（TTS 读作「零五分」）；小时走 12 小时制中文
+    （0 点与 12 点都是「十二点」）。rate/pitch 为 TTS 参数、音量在播放侧，
+    都不进入正文。
+    """
+    hour_12 = now.hour % 12 or 12
+    hour_cn = _HOUR_CN[hour_12 % 12]
+    period = _period_cn(now.hour)
+    if now.minute == 0:
+        return f"现在是{period}{hour_cn}点整"
+    return f"现在{period}{hour_cn}点{now.minute:02d}分"
+
+
+# 洗牌用的 64 位线性同余发生器参数（Knuth/MMIX）。刻意自带而不 import random：
+# 同一个日期在任何 Python 版本、任何进程上都必须洗出同一个排列，否则「今天这句
+# 台词」会在升级解释器后漂移（还会连带让已缓存的音频键对不上）。高质量位取高 31
+# 位（``>> 33``）而非低位取模，避免 LCG 低位周期短导致的排列偏差。
+_SHUFFLE_MASK = (1 << 64) - 1
+_SHUFFLE_MUL = 6364136223846793005
+_SHUFFLE_ADD = 1442695040888963407
+_SHUFFLE_SALT = 0x9E3779B97F4A7C15  # 混入日期序数，避免相邻日期的种子太相近
+
+
+def quote_day_order(pool, day_ordinal: int) -> tuple[str, ...]:
+    """把台词库按日期洗成当天的固定排列（确定性，与进程/解释器版本无关）。
+
+    以 ``day_ordinal``（``date.toordinal()``）为种子做 Fisher–Yates：同一天内
+    任意时刻、任意调用方（语音 / 气泡 / 缓存键）拿到的是同一个排列；换一天
+    整批顺序都不同，因此「每天同一时刻」不会再撞上同一句。
+    """
+    items = list(pool)
+    state = (int(day_ordinal) * _SHUFFLE_MUL + _SHUFFLE_SALT) & _SHUFFLE_MASK
+    for i in range(len(items) - 1, 0, -1):
+        state = (state * _SHUFFLE_MUL + _SHUFFLE_ADD) & _SHUFFLE_MASK
+        j = (state >> 33) % (i + 1)
+        items[i], items[j] = items[j], items[i]
+    return tuple(items)
+
+
+def chime_index_in_day(now: datetime, cfg: dict) -> int:
+    """当天第几次报时（0 起，含当前这一次），日内顺序取台词的游标。
+
+    各调度模式下当天 [00:00, now] 的报时点数量 - 1 即为答案，故直接算术求解
+    （旧实现逐分钟回溯，每小时 480 次判定；本函数每次报时要被语音与气泡各调
+    一次）。自定义时间点未命中时沿用最近一次，避免出现负数。
+    """
+    minute = now.minute
+    schedule = cfg.get("schedule", "hourly")
+    if schedule == "every_30":
+        return now.hour * 2 + (1 if minute >= 30 else 0)
+    if schedule == "every_15":
+        return now.hour * 4 + minute // 15
+    if schedule == "every_5":
+        return now.hour * 12 + minute // 5
+    if schedule == "every_minute":
+        return now.hour * 60 + minute
+    if schedule == "custom":
+        hhmm = f"{now.hour:02d}:{minute:02d}"
+        passed = sum(1 for item in cfg.get("custom_times", frozenset()) if item <= hhmm)
+        return max(passed - 1, 0)
+    return now.hour  # hourly（含未知模式兜底，与 clean_schedule 的回落一致）
+
+
+def pick_quote(now: datetime, cfg: dict) -> str:
+    """按「每天一套新排列 + 日内顺序取用」选取一句台词/歌词。
+
+    选取规则：
+    1. 音色以 zh 开头用中文库，否则用英文库；对应语言自定义条目非空时整体
+       替换内置库（留空回退内置库）；
+    2. 当日排列由 :func:`quote_day_order` 按日期算出 —— 同一天固定、跨天换新；
+    3. 取当日第 :func:`chime_index_in_day` 次报时对应的条目（顺序取用、
+       用尽回环），库比当天报时次数长时一天之内不会重句。
+    """
+    chinese = str(cfg.get("voice", DEFAULT_VOICE)).lower().startswith("zh")
+    custom = clean_custom_quotes(cfg.get("custom_quotes_zh" if chinese else "custom_quotes_en"))
+    pool = custom or (CHINESE_QUOTES if chinese else ENGLISH_QUOTES)
+    if not pool:
+        return ""
+    order = quote_day_order(pool, now.date().toordinal())
+    return order[chime_index_in_day(now, cfg) % len(order)]
+
+
+def build_chime_sentence(now: datetime, cfg: dict) -> str:
+    """完整报时语句：报时文本 + 轮换台词/歌词（句号分隔，便于 TTS 停顿）。
+
+    配置 ``show_quote`` 为 False 时仅返回报时文本（用户关闭台词/歌词）。
+    """
+    text = build_chime_text(now, cfg)
+    if not clean_flag(cfg.get("show_quote", DEFAULT_SHOW_QUOTE), DEFAULT_SHOW_QUOTE):
+        return text
+    quote = pick_quote(now, cfg)
+    return f"{text}。{quote}" if quote else text
+
+
+def build_chime_bubble_text(now: datetime) -> str:
+    """气泡展示用的报时文本：以阿拉伯数字为主（如“现在下午 15:45”）。
+
+    与 :func:`build_chime_text`（中文数字口播，供 TTS 与缓存键）解耦：气泡
+    只做视觉展示，用 24 小时制阿拉伯数字 + 中文时段词，避免“下午一点05分”
+    这类阿拉伯数字与中文数字混排。
+    """
+    return f"现在{_period_cn(now.hour)} {now.hour:02d}:{now.minute:02d}"
+
+
+def build_bubble_sentence(now: datetime, cfg: dict) -> str:
+    """气泡完整文本：阿拉伯数字报时 + 台词/歌词（与语音口播文本解耦）。
+
+    语音仍用 :func:`build_chime_sentence`（中文数字口播，作为合成输入与缓存键）；
+    两者在同一时刻取到同一条台词，仅时间部分表示不同。``show_quote`` 关闭时
+    只返回气泡报时文本。
+    """
+    text = build_chime_bubble_text(now)
+    if not clean_flag(cfg.get("show_quote", DEFAULT_SHOW_QUOTE), DEFAULT_SHOW_QUOTE):
+        return text
+    quote = pick_quote(now, cfg)
+    return f"{text}。{quote}" if quote else text
+
+
+def edge_rate_arg(rate) -> str:
+    """edge-tts rate 参数：如 +10% / -20% / +0%。"""
+    value = clean_rate(rate)
+    sign = "+" if value >= 0 else ""
+    return f"{sign}{value}%"
+
+
+def edge_pitch_arg(pitch) -> str:
+    """edge-tts pitch 参数：如 +5Hz / -10Hz / +0Hz。"""
+    value = clean_pitch(pitch)
+    sign = "+" if value >= 0 else ""
+    return f"{sign}{value}Hz"
+
+
+def cache_key(text: str, cfg: dict | None = None, provider_id: str | None = None,
+              values: dict | None = None) -> str:
+    """音频缓存文件名键：内容 + 该后端 flavor 的短哈希。
+
+    flavor 由 provider 给（只含影响音频内容的参数），因此换后端 / 换音色 / 换风格都会
+    换键，不同后端的缓存不会互串；edge 的 flavor 保持历史格式，老缓存升级后仍命中。
+
+    ``values`` 是**实际合成输入**（``TtsAttempt.values``，可能已被 ``preflight`` 校正）：
+    调用方手里已有解析结果时必须传它，而不是让本函数从 ``cfg`` 再取一次——配置里的
+    音色被 preflight 换掉后，两条路会算出两个键，产物身份与声音就对不上了。
+    """
+    import hashlib
+
+    cfg = cfg or {}
+    backend = clean_backend(provider_id or cfg.get("backend", BACKEND_EDGE))
+    provider = tts.get(backend)
+    if provider is None:
+        raw = f"{text}|{backend}"
+    else:
+        if values is None:
+            values = (cfg.get("providers") or {}).get(backend)
+            if values is None:
+                # 紧凑调用（传的是原始 config 映射）：让 provider 自己按字段 key 取值
+                values = provider.values(cfg)
+        raw = f"{text}|{provider.flavor(values)}"
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]

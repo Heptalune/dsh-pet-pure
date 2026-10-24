@@ -1,0 +1,101 @@
+# Linux 官方 wheel 6.12.0 在 Python 3.11 下每次 void 方法调用少还一个 Py_None 引用，
+# 跑久了 none_dealloc → SIGABRT（上游 PR #245 定位；tests/test_qt_timer_refcount.py 守门）。
+# Windows 同版实测引用差为 0，不受影响，所以只在 Linux 封顶。
+PySide6>=6.5,<6.12; sys_platform == "linux"
+PySide6>=6.5; sys_platform != "linux"
+imageio-ffmpeg>=0.6
+Pillow>=10.3
+keyring>=25
+# keyring 的 **Windows 后端**实现依赖（import 名 `win32ctypes`，PyPI 名 pywin32-ctypes）。
+# 显式声明 + 构建脚本里 `--collect-all win32ctypes` 是**打包加固**，不是"不改就必然
+# 不可用"：PyInstaller 自带的 hook 通常收得到它（实测 4.3.3 / 4.3.4 的 exe 内嵌 PYZ
+# 里 `win32ctypes.*` 都在），且 `keyring.backends.Windows` 在 ImportError 时还会回退到
+# pywin32 的 `pywintypes`/`win32cred`。加固的理由：那条收集是隐式的，与 keyring 版本
+# 失配时会静默丢，症状（凭据只活在写它的进程内存里、界面仍显示"已保存"）用户侧看不见。
+pywin32-ctypes>=0.2.0; platform_system == "Windows"
+certifi>=2024.0.0
+pycaw>=0.0.13; platform_system == "Windows"
+tzdata>=2024.1
+# 节日提醒（pet/festival_calendar.py）的农历与 24 节气换算。
+#
+# 许可证是硬约束：**不要换成流传更广的 lunardate / zhdate**。那两个都是
+# GPL-3.0-or-later（同源于 1988 年 Fung F. Lee / Ricky Yeung 的 GPLv2
+# lunar 项目），而本项目是 MIT，引入即造成 copyleft 传染。lunar-python
+# (6tail) 为 MIT，纯 Python，无数据文件、无传递依赖，PyInstaller 静态
+# 分析可完整收集（无需 --collect-all）。其农历与节气日已实测校验。
+lunar-python>=1.4.8
+
+# 语音报时（pet/voice_chime_service.py）的在线 TTS：edge-tts 走微软免费在线
+# 语音服务合成 mp3 后缓存播放。缺失时服务降级为仅气泡提示（不崩溃），但
+# 打包版用户无法自行 pip 安装——所以在此声明为运行时依赖，并在三个构建
+# 脚本里配 --collect-all edge_tts（它用 importlib.metadata 取版本、子模块
+# 存在动态导入，PyInstaller 静态分析收不全）。
+edge-tts>=7.3.1,<8
+
+# —— 歌词显示（可选）——
+# 「显示歌词」功能靠 Windows 系统媒体控制（SMTC）读取当前播放的曲目。
+# 不装不影响桌宠本体：歌词能力探测返回不可用，
+# 设置页的歌词开关置灰并说明原因，其余功能一切照旧。
+# 打包侧无需登记 hiddenimports：winrt 子模块由静态 import 连带收集（旧注释
+# 「必须登记，否则漏收」与实测矛盾，已删；复验证据见下面 winrt-Windows.Media 条）。
+winrt-Windows.Media.Control>=3.0; platform_system == "Windows"
+winrt-Windows.Foundation>=3.0; platform_system == "Windows"
+winrt-Windows.Foundation.Collections>=3.0; platform_system == "Windows"
+winrt-Windows.Storage.Streams>=3.0; platform_system == "Windows"
+# 媒体类型（音乐/视频）判定用：playback_type 的返回类型是
+# Windows.Media.MediaPlaybackType，定义它的枚举宿主包就是这一条。缺了它，
+# 访问 playback_type 会抛 AttributeError（本机未装该包时实测的正是这个错），
+# 于是"视频不当歌"静默退化成 Unknown（放行）——所以它是运行时依赖。
+#
+# 打包侧**无需新增 hiddenimports/collect**（2026-10 实测，PyInstaller 6.22.2）：
+# 只 static import winrt.windows.media.control 的冻结构建，产物里照样带上了
+# winrt/windows/media/__init__.py，frozen 程序读出的是
+# <MediaPlaybackType.MUSIC: 1>；本包此前也从未在任何构建脚本里登记过。
+winrt-Windows.Media>=3.0; platform_system == "Windows"
+
+# 歌词显示用它的「播放器进程在不在」判断来**避开 SMTC 的永久阻塞**
+# （见 pet/now_playing.py::player_process_running：进程不在就直接启动播放器、
+# 不碰 WinRT）。缺失时该判断按设计放行（宁可多试一次也不误伤），但这恰恰
+# 意味着 SMTC 卡住的那条路照旧会走——所以它是**运行时依赖**，必须在这里声明、
+# 并在三个构建脚本里 collect，否则打包版拿不到它，「避开阻塞」等于没生效。
+# 纯 Python、静态 import，PyInstaller 静态分析即可收集。
+psutil>=5.9
+
+# —— 快速识屏：本地 OCR（pet/screen_capture/ocr.py + ocr_worker.py）——
+# RapidOCR（PP-OCR 模型 + ONNXRuntime 推理），全靠本地、断网可用：模型文件随包
+# 放在 resources/rapidocr_models/（检出后 31.6 MB，见 pet/screen_capture/ocr_models.py
+# 的模块说明里有现成的重新取出命令）。
+#
+# **为什么不是 rapidocr-onnxruntime**：那个包（这个项目的上一代发行名）在 PyPI 上
+# 钉死了 `Requires-Python: <3.13,>=3.6`，本机是 3.13.7，pip 只会回退到 2023 年的
+# 1.2.3；`rapidocr` 是同一个项目改的名（RapidAI），仍是 onnxruntime 推理同一批
+# PP-OCR 模型，且支持 3.8~3.x 全段。两个包不能同时装（会争 rapidocr 顶层模块名）。
+rapidocr>=3.10,<4
+
+# 推理引擎。rapidocr 本身**不**依赖任何引擎（它支持 onnxruntime / openvino /
+# paddle / torch / tensorrt），所以引擎必须在这里单独声明，否则识别时会抛
+# ImportError：本应用的取舍是 ONNXRuntime——CPU-only、无 GPU 驱动依赖、体积可控。
+# 本机验证版本 1.20.1；1.31 起 sympy 从硬依赖降为 extra（安装/打包面更小）。
+onnxruntime>=1.20
+
+# 下面三个虽然也是 rapidocr 的传递依赖，但 pet/screen_capture/ 下的产品代码**直接
+# import 它们**，所以按仓库既有口径（tests/test_runtime_dependencies.py：「运行时
+# import 了却没人声明」是缺陷）显式写在最前面，不靠别人带：
+#   numpy：输出块的坐标，以及识别子进程里把 PNG 字节包成解码输入。
+#   omegaconf：rapidocr 的配置容器；用它 document 的 allow_objects 开关把自建的
+#              onnxruntime session 注入进去（详见 ocr_worker.py::_attach_sessions）。
+#   opencv：识别子进程拿到的是一张 PNG（宿主侧 QImage 内存编码，不落盘），解码
+#           归 cv2 管——它的 IMREAD_COLOR 会把带 alpha / 灰度 / 调色板的图一律
+#           折成 rapidocr 要的 3 通道 BGR。rapidocr 声明的是
+#           opencv-python-headless；本机两套都在，headless 才是跑服务该装的那一个。
+numpy>=1.26
+omegaconf>=2.3
+opencv-python-headless>=4.5.1.48
+
+# —— 开发依赖（测试 + 静态检查）——
+# pytest：测试套件入口（README「测试与验证」与本仓库 CI 都依赖它）。
+# ruff：`ruff check pet/ tests/` 用的静态检查器（规则基线见 pyproject.toml
+# 的 [tool.ruff]，仅 F 级）。不参与运行时；声明在此使 fresh environment
+# 能按 requirements 复现静态检查（FINAL_REVIEW_GPT.md 提交卫生项，批10 补）。
+pytest>=8
+ruff>=0.5

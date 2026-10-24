@@ -1,0 +1,251 @@
+# -*- coding: utf-8 -*-
+"""拖拽物理的纯函数核心：弹簧步进 / 松手初速估算 / 抛掷步进。
+
+抽成纯函数是为了可单测（PR 路线 Phase 1）；window.py 只负责喂状态和搬窗口。
+所有参数集中在此并注释取值依据，不再散落硬编码。
+"""
+
+from __future__ import annotations
+
+import math
+
+# ---- 拖拽弹簧 ----
+SPRING_K = 200.0          # 弹簧刚度：越大跟手越紧
+SPRING_C = 30.0           # 阻尼：ζ=c/(2√k)≈1.06 过阻尼，不 overshoot
+
+# ---- 松手初速估算 ----
+TRAIL_KEEP_SEC = 0.15     # 拖拽途中只保留这么长的轨迹
+RELEASE_WINDOW_SEC = 0.12  # 初速估算取末尾这段窗口
+RELEASE_STALE_SEC = 0.15  # 松手前停顿超过它 = 静止放下（不带残余速度）
+MIN_SPAN_SEC = 0.02       # 窗口太短视为不可估算
+SEG_MIN_DT = 0.008        # 分段速度的最小 dt：高回报率鼠标事件间隔可低至 1ms，
+                          # 过小的 dt 会把抖动放大成虚假峰值，短段向前合并
+DEAD_ZONE_SPEED = 500.0   # 低于此速度 = 原地放下（px/s）
+MAX_THROW_SPEED = 6000.0  # 甩出速度上限默认值（px/s）：软膝渐近值
+PEAK_WEIGHT = 0.5         # 初速大小 = 端点均值*(1-w) + 窗口峰值*w
+ACCEL_REF = 8000.0        # 参考加速度（px/s²）：末段加速达到它即吃满增益
+ACCEL_GAIN_MAX = 0.6      # 加速度增益上限：仍在加速的甩动最多放大 60%
+
+# ---- 甩出力度档位 ----
+THROW_STRENGTH_CAPS = {
+    "gentle": 3600.0,
+    "standard": 4800.0,
+    "strong": 7200.0,
+    "crazy": 9000.0,
+}
+
+
+def normalize_throw_strength(value: str) -> str:
+    s = str(value or "").strip().lower()
+    if s in THROW_STRENGTH_CAPS:
+        return s
+    return "standard"
+
+
+def throw_speed_cap(strength: str) -> float:
+    normalized = normalize_throw_strength(strength)
+    return THROW_STRENGTH_CAPS[normalized]
+
+
+# ---- 弹弓参数（不可配置常量） ----
+SLINGSHOT_MIN_DISTANCE = 24.0
+SLINGSHOT_MAX_DISTANCE = 160.0
+SLINGSHOT_BASE_SPEED = 900.0
+SLINGSHOT_MAX_DEFORMATION = 1.3
+
+
+def slingshot_deformation(pull_x: float, pull_y: float, progress: float,
+                          maximum: float = SLINGSHOT_MAX_DEFORMATION) -> tuple[float, float]:
+    """Return smooth x/y scale factors for an anisotropic slingshot stretch.
+
+    The stretch and compression axes are projected onto the widget axes, so
+    changing the pull angle never selects between discontinuous branches.
+    """
+    progress = max(0.0, min(1.0, float(progress)))
+    maximum = max(1.0, float(maximum))
+    distance = math.hypot(float(pull_x), float(pull_y))
+    if distance <= 1e-6 or progress <= 0.0:
+        return 1.0, 1.0
+    ux, uy = float(pull_x) / distance, float(pull_y) / distance
+    stretch = 1.0 + (maximum - 1.0) * progress
+    squeeze = 1.0 - (1.0 - 1.0 / maximum) * progress
+    return (
+        math.hypot(stretch * ux, squeeze * uy),
+        math.hypot(stretch * uy, squeeze * ux),
+    )
+
+# ---- 抛掷 ----
+GRAVITY = 1400.0          # px/s²
+# 碰边恢复系数。0.78 → 0.68：thrown 的地面段长度 ≈ 2·RESTITUTION·(v0-STOP)/(g·(1-RESTITUTION))，
+# 0.78 时一次满屏高度的抛掷要在 ~11s / 15 次弹跳后才满足 is_at_rest——这段
+# 时间 interaction_state 一直挂在 "thrown"，行为机不重绑、抛掷 clip 播完停在
+# 最后一帧（实机"碰撞后画面卡住不动"的直接观感）。0.68 把同一场抛掷收敛到
+# ~5s / 8 次弹跳（"地面弹跳段不超过 5s"是这次的设计目标，见
+# docs/PR-REPORT-THROWN-ISLAND-PUMP-2026-09-24.md 的对照表）。
+RESTITUTION = 0.68        # 碰边恢复系数
+GROUND_FRICTION = 2.5     # 地面水平摩擦（/s）
+REST_VY = 40.0            # 落地时 |vy| 小于它直接停竖直
+# 地面小跳截止速度：落地那一刻 |vy| 低于它就按"已经落地"处理（不再模拟
+# 这一跳）。REST_VY=40 等效弹起高度只有 0.6px——纯亚像素抖动，却要多算
+# 3~4 次弹跳（每次 ~0.2s 的几何级数尾巴）；120 等效弹起高度 5px，肉眼
+# 不可辨，是"宠物已经站着不动"的合理判定点。
+GROUND_BOUNCE_STOP_VY = 120.0
+REST_VX = 15.0            # 地面上 |vx| 小于它认为已静止
+# 侧墙水平速度截止（2026-10-22，用户实机）：|vx| 低于它在墙上直接停下
+# （重力接管沿墙滑落到墙角静止），不再「贴墙一帧黏住 → 以 RESTITUTION 弹回」
+# ——地板早就有 GROUND_BOUNCE_STOP_VY 同款截止，侧墙一直漏了，低速撞墙观感
+# 是莫名其妙的黏住反弹（主→副屏底部那条收窄带墙上尤其明显）。
+WALL_BOUNCE_STOP_VX = 60.0
+
+
+def flight_anim_speed(speed_px_s: float) -> float:
+    """抛掷飞行期动画播放倍率（高速频闪修法）。
+
+    素材均 24fps：1400px/s 飞行时精灵每帧位移 ~58px，肉眼频闪即"帧数低"
+    的观感（实机遥测归因）。倍率随速度线性升到 1.75×（等效 ~42fps，每帧
+    位移缩到 ~33px），静止/低速=1× 不变速；被扔时"扑腾感"反而更自然。
+    口径备注：倍率作用于消费端帧间隔；解码端 readrate 在 reader 启动时
+    固定，高于解码速率的增量以跳帧方式呈现（动画在更短墙钟内播完），
+    不是解码端真的交付 42fps（A3 评审措辞修正；readrate 跟随属后续改进）。
+    """
+    s = max(0.0, float(speed_px_s))
+    return 1.0 + min(s / 1400.0, 1.0) * 0.75
+
+
+def soft_clamp_speed(speed: float, cap: float = MAX_THROW_SPEED) -> float:
+    """软上限：cap*(1-e^(-s/cap))。硬钳会把所有快甩压成同一个速度
+    （"甩多快都一样"），软膝曲线保证任意力度下速度仍单调可区分，
+    同时渐近不超过 cap。"""
+    if speed <= 0.0 or cap <= 0.0:
+        return 0.0
+    return cap * (1.0 - math.exp(-speed / cap))
+
+
+def slingshot_speed(distance: float, minimum: float, maximum: float, cap: float) -> float:
+    """Map pull distance to an ease-out launch speed bounded by ``cap``."""
+    if distance < minimum or maximum <= minimum or cap <= 0.0:
+        return 0.0
+    u = max(0.0, min(1.0, (float(distance) - minimum) / (maximum - minimum)))
+    eased = 1.0 - (1.0 - u) ** 2
+    raw = SLINGSHOT_BASE_SPEED + (3.0 * cap - SLINGSHOT_BASE_SPEED) * eased
+    return soft_clamp_speed(raw, cap=cap)
+
+
+def slingshot_trajectory(vx: float, vy: float, duration: float = 0.8,
+                         points: int = 12, gravity: float = GRAVITY
+                         ) -> list[tuple[float, float]]:
+    """Sample a first-flight parabolic path relative to its launch point."""
+    if duration <= 0.0 or points <= 0:
+        return []
+    if points == 1:
+        return [(0.0, 0.0)]
+    step = float(duration) / (points - 1)
+    return [(float(vx) * (i * step),
+             float(vy) * (i * step) + 0.5 * float(gravity) * (i * step) ** 2)
+            for i in range(points)]
+
+
+def spring_velocity(v: float, x: float, target: float, dt: float,
+                    k: float = SPRING_K, c: float = SPRING_C) -> float:
+    """过阻尼弹簧单轴速度步进（调用方随后 x += v*dt）。"""
+    return v + ((target - x) * k - v * c) * dt
+
+
+def _window(trail: list, now: float, span: float) -> list:
+    cutoff = now - span
+    return [s for s in trail if s[0] >= cutoff]
+
+
+def estimate_release_velocity(trail: list, now: float, cap: float = MAX_THROW_SPEED) -> tuple[float, float]:
+    """由拖拽轨迹估算松手初速 (vx, vy)。
+
+    方向：窗口首末端点位移方向（抗抖）。
+    大小：端点平均速度与窗口内峰值分段速度按 PEAK_WEIGHT 加权——
+    弥补纯端点平均对"快甩"的低估（快甩的位移集中在窗口内一小段）。
+    增益：窗口末段仍在加速（末分段速度 > 首分段速度）时，
+    按加速度占 ACCEL_REF 的比例放大，最多 ACCEL_GAIN_MAX。
+    松手前停顿 > RELEASE_STALE_SEC 返回零速（原地放下）。
+    """
+    if not trail:
+        return 0.0, 0.0
+    if now - trail[-1][0] > RELEASE_STALE_SEC:
+        return 0.0, 0.0
+    win = _window(trail, now, RELEASE_WINDOW_SEC)
+    if len(win) < 2:
+        return 0.0, 0.0
+    t0, x0, y0 = win[0]
+    t1, x1, y1 = win[-1]
+    span = t1 - t0
+    if span < MIN_SPAN_SEC:
+        return 0.0, 0.0
+
+    dx, dy = x1 - x0, y1 - y0
+    base_vx, base_vy = dx / span, dy / span
+    base_speed = math.hypot(base_vx, base_vy)
+
+    # 分段速度（过密采样向前合并，dt 下限 SEG_MIN_DT）
+    seg_speeds: list[tuple[float, float]] = []  # (speed, t_end)
+    px_, py_, pt_ = x0, y0, t0
+    for t, x, y in win[1:]:
+        dt = t - pt_
+        if dt >= SEG_MIN_DT:
+            seg_speeds.append((math.hypot(x - px_, y - py_) / dt, t))
+            px_, py_, pt_ = x, y, t
+    peak_speed = max((s for s, _ in seg_speeds), default=base_speed)
+
+    # 末段加速度：最后一个有效分段 vs 第一个有效分段
+    accel = 0.0
+    if len(seg_speeds) >= 2:
+        accel = (seg_speeds[-1][0] - seg_speeds[0][0]) / max(seg_speeds[-1][1] - seg_speeds[0][1], MIN_SPAN_SEC)
+
+    speed = (1.0 - PEAK_WEIGHT) * base_speed + PEAK_WEIGHT * peak_speed
+    gain = 1.0 + min(max(accel, 0.0) / ACCEL_REF, 1.0) * ACCEL_GAIN_MAX
+    speed = soft_clamp_speed(speed * gain, cap=cap)
+
+    if base_speed < 1e-6:
+        # 窗口内几乎纯抖动：沿峰值分段方向？没有可靠方向 → 垂直下落
+        return 0.0, speed
+    return base_vx / base_speed * speed, base_vy / base_speed * speed
+
+
+def throw_step(px: float, py: float, vx: float, vy: float, dt: float,
+               left: float, top: float, right: float, bottom: float,
+               gravity: float = GRAVITY,
+               bounce_stop_vy: float = GROUND_BOUNCE_STOP_VY,
+               wall_stop_vx: float = WALL_BOUNCE_STOP_VX,
+               ) -> tuple[float, float, float, float, bool]:
+    """抛掷单步积分 + 边界反弹。返回 (px, py, vx, vy, bounced)。
+
+    bounce_stop_vy：落地竖直速度截止（小跳不再模拟，见常量注释）。
+    wall_stop_vx：撞侧墙水平速度截止（低速沿墙滑落不弹回，见常量注释）。
+    """
+    vy += gravity * dt
+    px += vx * dt
+    py += vy * dt
+    bounced = False
+    if px < left:
+        px = left
+        vx = 0.0 if abs(vx) < wall_stop_vx else abs(vx) * RESTITUTION
+        bounced = True
+    elif px > right:
+        px = right
+        vx = 0.0 if abs(vx) < wall_stop_vx else -abs(vx) * RESTITUTION
+        bounced = True
+    if py < top:
+        py, vy, bounced = top, abs(vy) * RESTITUTION, True
+    elif py >= bottom:
+        py = bottom
+        vx *= max(0.0, 1.0 - GROUND_FRICTION * dt)
+        if abs(vy) < bounce_stop_vy:
+            vy = 0.0
+        else:
+            vy = -abs(vy) * RESTITUTION
+        bounced = True
+    return px, py, vx, vy, bounced
+
+
+def is_at_rest(py: float, vx: float, vy: float, bottom: float, bounced: bool, speed: float) -> bool:
+    """抛掷终止判定：贴地且双轴低速，或碰边后整体低速。"""
+    if py >= bottom - 1 and abs(vy) < 1 and abs(vx) < REST_VX:
+        return True
+    return bounced and speed < REST_VY and abs(vy) < 1

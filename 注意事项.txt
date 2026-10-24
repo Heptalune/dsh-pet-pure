@@ -1,0 +1,22 @@
+dsh-pet-pure 注意事项（2026-10-24）
+====================================
+
+1. 本 Fork 只发布「纯桌宠」变体：不联网、无 AI 对话、无附加功能，
+   双击即用，无需账号或 API Key。
+
+2. 两个安装版的区别只在动画画质：
+   - light（125MB）：WebM 直播，后台自动逐段升级无损画质（每次开机约一段，
+     待机动画首次启动即转好）
+   - 标准（258MB）：高频 11 段出厂即无损，开箱零白晕
+   功能、动画数量、交互完全一致。
+
+3. 不含在线更新：升级 = 到项目主页重新下载，或自行重新构建
+   （powershell -ExecutionPolicy Bypass -File scripts\build_pure.ps1）。
+
+4. 素材版权归原作者（PC2005-cloud/dsh-pet），仅限个人使用，
+   详见 THIRD_PARTY_NOTICES.md。
+
+5. 自定义角色：把透明 WebM 按 idle/turn/move/click/drag/random 分类放进
+   characters\<角色ID>\videos\，右键菜单即可热加载切换。
+
+6. 项目主页：https://github.com/Heptalune/dsh-pet-pure

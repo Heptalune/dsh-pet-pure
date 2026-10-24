@@ -1,0 +1,1810 @@
+# -*- coding: utf-8 -*-
+"""桌宠自言自语与聊天状态使用的轻量气泡。
+
+macOS 焦点问题由气泡窗口自身解决：`WindowDoesNotAcceptFocus`、
+`WA_ShowWithoutActivating` 和透明鼠标事件共同保证提示不会成为键盘或
+鼠标目标。应用本身保持 Regular activation policy，Dock 图标因此可见。
+
+注意：不要用“绕过 Qt show() 直接对原生窗口 orderFront”的做法——Qt
+认为窗口未显示就不会触发绘制，气泡会“出现但看不见”。
+
+批6-2 拆分（纯搬移，逻辑/绘制/时序零改动）：
+- pet/speech_bubble_text.py — 纯函数区（文本分页/定位/内容模型）整体迁出；
+- 本文件保留 PetSpeechBubble（状态/绘制/窗口生命周期）与 BUBBLE_STYLE_PRESETS，
+  并对拆分出的纯函数做 re-export，维持既有 `from pet.speech_bubble import ...`
+  兼容，外部调用点零改动。
+"""
+from __future__ import annotations
+
+import logging
+import sys
+
+log = logging.getLogger(__name__)
+from math import ceil, floor
+from pathlib import Path
+
+from PySide6.QtCore import (
+    QEasingCurve, QPoint, QPointF, QPropertyAnimation, QRect, QRectF, QSize, Qt, QTimer,
+    Signal,
+)
+from PySide6.QtGui import (
+    QColor, QFontMetrics, QGuiApplication, QPainter, QPainterPath, QPen,
+    QPixmap, QTransform,
+)
+from PySide6.QtWidgets import (
+    QFrame,
+    QGraphicsOpacityEffect,
+    QLabel,
+    QLayout,
+    QPushButton,
+    QSizePolicy,
+    QVBoxLayout,
+    QWidget,
+)
+
+# 批6-2 拆分后纯函数区 re-export（维持既有 import 兼容；外部调用点本批不改）
+from .speech_bubble_text import (
+    BUBBLE_BODY_FONT_PX,
+    BUBBLE_SUBTITLE_FONT_PX,
+    BUBBLE_TEXT_COLUMN,
+    BUBBLE_TEXT_COLUMN_MAX,
+    BUBBLE_TEXT_SCALE_MAX,
+    BUBBLE_TEXT_SCALE_MIN,
+    BUBBLE_TEXT_SLACK,
+    BUBBLE_TITLE_FONT_PX,
+    PAGE_DWELL_MAX_MS,
+    PAGE_DWELL_MIN_MS,
+    PAGE_FADE_IN_MS,
+    PAGE_FADE_OUT_MS,
+    PAGE_RETURN_PAUSE_MS,
+    SELF_TALK_IMAGE_SUFFIXES,
+    _budget_length,
+    breath_bubble_size_for_anchor,
+    breath_bubble_size_for_scale,
+    bubble_column_for_text,
+    bubble_label_size,
+    bubble_max_lines,
+    bubble_rect_for_anchor,
+    bubble_wrap_width,
+    clamp_bubble_text_scale,
+    elide_bubble_text,
+    list_self_talk_images,
+    normalize_bubble_text,
+    page_dots,
+    page_dwell_ms,
+    page_dwells_ms,
+    paginate_bubble_text,
+    scale_bubble_font_px,
+    truncate_bubble_text,
+)
+
+__all__ = [
+    "BUBBLE_BODY_FONT_PX",
+    "BUBBLE_TEXT_COLUMN",
+    "BUBBLE_TEXT_COLUMN_MAX",
+    "BUBBLE_TEXT_SCALE_MAX",
+    "BUBBLE_TEXT_SCALE_MIN",
+    "BUBBLE_TEXT_SLACK",
+    "PAGE_DWELL_MAX_MS",
+    "PAGE_DWELL_MIN_MS",
+    "PAGE_RETURN_PAUSE_MS",
+    "SELF_TALK_IMAGE_BOX_H",
+    "SELF_TALK_IMAGE_BOX_W",
+    "SELF_TALK_IMAGE_SUFFIXES",
+    "BUBBLE_STYLE_PRESETS",
+    "breath_bubble_size_for_anchor",
+    "breath_bubble_size_for_scale",
+    "bubble_column_for_text",
+    "bubble_label_size",
+    "bubble_max_lines",
+    "bubble_rect_for_anchor",
+    "bubble_wrap_width",
+    "clamp_bubble_text_scale",
+    "elide_bubble_text",
+    "list_self_talk_images",
+    "normalize_bubble_text",
+    "page_dots",
+    "page_dwell_ms",
+    "page_dwells_ms",
+    "paginate_bubble_text",
+    "scale_bubble_font_px",
+    "truncate_bubble_text",
+    "PetSpeechBubble",
+]
+
+_MAC = sys.platform == "darwin"
+
+# 标题优先气泡（歌词）在"同一次显示"期间把宽度锁在整栏宽。
+# 原因：气泡定位是按当前尺寸居中算的，歌词每句长短不同 → 宽度变 →
+# 左边跟着跳（实测 200px 与 264px 相差 32px）。锁宽后位置不再抖。
+TITLE_FIRST_COLUMN = BUBBLE_TEXT_COLUMN
+
+# 交互按钮行里除 ``(label, callback)`` 按钮外的结构化行标记：
+# - (SECTION_HEADER_LABEL, text) —— 分支/小节标题（独占一行、加粗）
+# - (SECTION_HINT_LABEL, text)  —— 灰色提示行（独占一行）
+# 由 agent_link 的多分支问题收集模式生成，SpeechBubble 负责渲染。
+SECTION_HEADER_LABEL = "__pet_section_header__"
+SECTION_HINT_LABEL = "__pet_section_hint__"
+
+# 配图气泡的显示盒（逻辑像素，**未乘**用户「配图大小」系数）：标准气泡按它
+# 把配图等比适配进 QLabel，呼吸气泡的内容安全区也由它推算。overlay 壳的配图
+# 解码缓存按「本盒长边 × 配图大小 × 屏幕 DPR × 余量」定目标像素
+# （``overlay_shell.self_talk_image_cache_edge``）——两处共用同一份数字，
+# 免得缓存尺寸与显示尺寸各改一半（N2）。
+SELF_TALK_IMAGE_BOX_W = 220
+SELF_TALK_IMAGE_BOX_H = 140
+
+# 呼吸泡正文盒的最小高度（逻辑像素）：低于它正文会被挤成一条缝，宁可放大画布。
+BREATH_LABEL_MIN_H = 42
+
+# 呼吸泡副标题的左右安全内边距下限（参考画布 240 宽下的逻辑像素）：有机轮廓
+# 底部两角向内收，左对齐的副标题末行会压到轮廓外沿。真正使用的内边距由
+# ``PetSpeechBubble._breath_subtitle_side_insets`` 按轮廓弦算出，这里是取不到
+# 轮廓时的兜底与最小值——保证轮廓宽松处观感不变。
+BREATH_SUBTITLE_SIDE_INSET = 14
+
+# 副标题文本列与轮廓弦之间再留的像素（逻辑像素）：轮廓是三次贝塞尔，按行采样
+# 的弦有半像素级误差，文字自身也带一点侧边距，留 1px 让墨迹整格落在轮廓内。
+BREATH_SUBTITLE_SIDE_CLEARANCE = 1
+
+# 呼吸泡画布宽度上限（参考画布 240 宽下的逻辑像素）：文字/配图内容按缩放系数
+# 换算，超长内容不允许把水泡顶成整屏。
+BREATH_CANVAS_MAX_W = 320
+
+
+def breath_main_bubble_path(canvas: QSize) -> QPainterPath:
+    """呼吸泡主泡的有机轮廓：画布尺寸 → 路径（纯函数）。
+
+    主泡绘制与副标题安全区（``PetSpeechBubble._breath_subtitle_side_insets``）
+    共用同一出处：文字列按轮廓的弦收进，两边各画一套几何必然分叉。
+    """
+    sx = max(0.01, canvas.width() / 240.0)
+    sy = max(0.01, canvas.height() / 195.0)
+    rect = QRectF(5 * sx, 4 * sy, 193 * sx, 163 * sy)
+    x, y, width, height = rect.x(), rect.y(), rect.width(), rect.height()
+    main = QPainterPath()
+    main.moveTo(x + width * 0.17, y + height * 0.06)
+    main.cubicTo(
+        x + width * 0.43, y - height * 0.03,
+        x + width * 0.73, y + height * 0.01,
+        x + width * 0.89, y + height * 0.20,
+    )
+    main.cubicTo(
+        x + width * 1.01, y + height * 0.35,
+        x + width * 1.01, y + height * 0.65,
+        x + width * 0.86, y + height * 0.83,
+    )
+    main.cubicTo(
+        x + width * 0.67, y + height * 1.02,
+        x + width * 0.33, y + height * 1.02,
+        x + width * 0.13, y + height * 0.84,
+    )
+    main.cubicTo(
+        x - width * 0.02, y + height * 0.68,
+        x - width * 0.04, y + height * 0.39,
+        x + width * 0.07, y + height * 0.22,
+    )
+    main.cubicTo(
+        x + width * 0.09, y + height * 0.16,
+        x + width * 0.12, y + height * 0.10,
+        x + width * 0.17, y + height * 0.06,
+    )
+    main.closeSubpath()
+    return main
+
+
+class FlowLayout(QLayout):
+    """流式布局：子项超出可用宽度时自动换行（按钮行专用）。
+
+    审批/选择题气泡的按钮行用 QHBoxLayout 时，选项一多就把气泡整个撑宽。
+    FlowLayout 让按钮在气泡固定宽度内自动折行，气泡宽度封顶、不被拉长。
+    """
+
+    def __init__(self, parent=None, h_spacing: int = 6, v_spacing: int = 6) -> None:
+        super().__init__(parent)
+        self._items: list[QLayout.Item] = []
+        self._h_spacing = h_spacing
+        self._v_spacing = v_spacing
+        self.setContentsMargins(0, 0, 0, 0)
+
+    def __del__(self) -> None:
+        while self.count():
+            self.takeAt(0)
+
+    def addItem(self, item) -> None:
+        self._items.append(item)
+
+    def count(self) -> int:
+        return len(self._items)
+
+    def itemAt(self, index: int):
+        if 0 <= index < len(self._items):
+            return self._items[index]
+        return None
+
+    def takeAt(self, index: int):
+        if 0 <= index < len(self._items):
+            return self._items.pop(index)
+        return None
+
+    def expandingDirections(self):
+        return Qt.Orientation(0)
+
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+    def heightForWidth(self, width: int) -> int:
+        return self._do_layout(QRect(0, 0, width, 0), test_only=True)
+
+    def setGeometry(self, rect: QRect) -> None:
+        super().setGeometry(rect)
+        self._do_layout(rect, test_only=False)
+
+    def sizeHint(self) -> QSize:
+        return self.minimumSize()
+
+    def minimumSize(self) -> QSize:
+        size = QSize()
+        for item in self._items:
+            size = size.expandedTo(item.minimumSize())
+        m = self.contentsMargins()
+        return size + QSize(m.left() + m.right(), m.top() + m.bottom())
+
+    def _do_layout(self, rect: QRect, *, test_only: bool) -> int:
+        m = self.contentsMargins()
+        effective = rect.adjusted(m.left(), m.top(), -m.right(), -m.bottom())
+        x = effective.x()
+        y = effective.y()
+        line_height = 0
+        for item in self._items:
+            hint = item.sizeHint()
+            space_x = self._h_spacing if self._h_spacing >= 0 else item.widget().style().layoutSpacing(
+                QSizePolicy.Policy.PushButton, QSizePolicy.Policy.PushButton,
+                Qt.Orientation.Horizontal,
+            )
+            space_y = self._v_spacing if self._v_spacing >= 0 else item.widget().style().layoutSpacing(
+                QSizePolicy.Policy.PushButton, QSizePolicy.Policy.PushButton,
+                Qt.Orientation.Vertical,
+            )
+            next_x = x + hint.width() + space_x
+            if next_x - space_x > effective.right() and line_height > 0:
+                # 放不下且本行已有内容：换行
+                x = effective.x()
+                y = y + line_height + space_y
+                next_x = x + hint.width() + space_x
+                line_height = 0
+            if not test_only:
+                item.setGeometry(QRect(QPoint(x, y), hint))
+            x = next_x
+            line_height = max(line_height, hint.height())
+        return y + line_height - rect.y() + m.bottom()
+
+
+# Each preset deliberately combines a distinct surface treatment with a preferred
+# anchor.  They are not colour-only aliases of the legacy bubble.
+BUBBLE_STYLE_PRESETS = {
+    "classic_top": {
+        "label": "经典暖黄 · 正上方", "placement": "top",
+        "background": "#fffaf0", "border": "#efc261", "foreground": "#403725",
+        "radius": 14, "shadow": "#6b542b",
+    },
+    "paper_left": {
+        "label": "纸感卡片 · 左上方", "placement": "top_left",
+        "background": "#ffffff", "border": "#dce1e7", "foreground": "#252a32",
+        "radius": 11, "shadow": "#374151",
+    },
+    "glass_right": {
+        "label": "深色玻璃 · 右上方", "placement": "top_right",
+        "background": "#292d36", "border": "#4d5360", "foreground": "#f7f8fb",
+        "radius": 18, "shadow": "#111318",
+    },
+    "soft_blue_top": {
+        "label": "柔蓝对话 · 正上方", "placement": "top",
+        "background": "#eef6ff", "border": "#a9c9ef", "foreground": "#24466f",
+        "radius": 16, "shadow": "#315f91",
+    },
+    "breath_bubble": {
+        "label": "吐气水泡 · 左上方", "placement": "top_left",
+        "background": "#fbfeff", "border": "#0e5968", "foreground": "#23444d",
+        "radius": 0, "shadow": "#0e5968", "shape": "breath_bubble",
+    },
+}
+
+
+class PetSpeechBubble(QFrame):
+    """不依赖桌宠透明窗口的独立气泡，支持跨屏幕边界自动选位。"""
+
+    clicked = Signal()
+
+    # 气泡被隐藏（自动超时 / dismiss / 窗口隐藏）时发出，供上层在仍有
+    # 待处理审批时自动恢复展示。
+    hidden_signal = Signal()
+
+    def __init__(self, parent=None, style_id: str = "classic_top"):
+        super().__init__(parent)
+        self._interactive = False
+        self._capture_compat = False
+        self._capture_host: QWidget | None = None
+        # 置顶跟随宿主「桌面置顶」设置（set_host_on_top）：宿主不置顶时气泡
+        # 也不置顶，否则宠物被其他窗口挡住、气泡却浮在最上层。
+        self._host_on_top = True
+        self.setObjectName("pet-speech-bubble")
+        self._apply_window_flags()
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        if _MAC:
+            # 与主窗口一致：Tool 窗口置顶在 macOS 上需要该属性（QTBUG-38580）
+            self.setAttribute(Qt.WidgetAttribute.WA_MacAlwaysShowToolWindow, True)
+        self.label = QLabel(self)
+        self.label.setObjectName("pet-speech-label")
+        # Text is pre-wrapped with the actual font metrics so the organic safe
+        # area has a deterministic three-line limit. Letting QLabel wrap again
+        # can turn those three lines into four after stylesheet font polishing.
+        self.label.setWordWrap(False)
+        self.label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.label.setStyleSheet("background: transparent; border: none; padding: 0;")
+        self._layout = QVBoxLayout(self)
+        self._layout.setContentsMargins(13, 10, 13, 17)
+        self._layout.addWidget(self.label)
+        self._subtitle_label = QLabel(self)
+        self._subtitle_label.setObjectName("pet-speech-subtitle")
+        # The subtitle is user/LLM supplied (for example the watchdog's
+        # recommendation).  Keep it inside the same text column as the main
+        # message; QLabel otherwise reports the full unwrapped line as its
+        # sizeHint and can stretch an interactive bubble across the chat UI.
+        # 上限值随「气泡文字大小」缩放、并在 show_text 里抬到气泡真实内宽，
+        # 见 _sync_subtitle_max_width（issue #216：写死 248px 会让 Qt 的
+        # 定高口径与绘制口径分叉，副标题多出一行被裁）。
+        self._subtitle_label.setWordWrap(True)
+        self._subtitle_label.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
+        )
+        self._subtitle_label.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+        )
+        self._subtitle_label.hide()
+        self._layout.addWidget(self._subtitle_label)
+        self._page_indicator = QLabel(self)
+        self._page_indicator.setObjectName("pet-page-indicator")
+        self._page_indicator.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        self._page_indicator.hide()
+        self._layout.addWidget(self._page_indicator, 0, Qt.AlignmentFlag.AlignRight)
+        # 交互按钮行（审批「同意/拒绝」、问题「A/B/C」等）：默认隐藏，仅
+        # show_text(buttons=...) 时出现。气泡平时对鼠标全透明，交互时临时关闭
+        # 该属性让按钮可点，dismiss/隐藏时恢复穿透。
+        # 用 FlowLayout 代替 QHBoxLayout，选项多时自动换行，不被撑宽。
+        self._button_row = QWidget(self)
+        self._button_row.setObjectName("pet-speech-buttons")
+        self._button_layout = FlowLayout(self._button_row, h_spacing=6, v_spacing=6)
+        self._button_layout.setContentsMargins(0, 4, 0, 0)
+        self._button_row.hide()
+        self._layout.addWidget(self._button_row)
+        self._interactive_active = False
+        self._interactive_buttons: list[QPushButton] = []
+        # 长文本分页状态：页列表 + 当前页 + 逐页停留表 + 自动翻页定时器。
+        # 气泡对鼠标全透明（WA_TransparentForMouseEvents），无法靠点击翻页，
+        # 因此采用「每页按字数停留一段后自动翻下一页」的方式保证全文可读完。
+        self._pages: list[str] = []
+        self._page_index = 0
+        self._page_dwells: list[int] = []
+        self._page_timer = QTimer(self)
+        self._page_timer.setSingleShot(True)
+        self._page_timer.timeout.connect(self._on_page_timeout)
+        # 翻页淡入淡出：当前动画句柄 + 懒创建的 label 透明度效果。
+        self._page_fade: QPropertyAnimation | None = None
+        self._label_opacity: QGraphicsOpacityEffect | None = None
+        # 位置滑动动画（懒创建）：气泡每次改位置都滑过去而非瞬移。
+        self._pos_anim: QPropertyAnimation | None = None
+        self._style_id = ""
+        self._preset = BUBBLE_STYLE_PRESETS["classic_top"]
+        self._anchor_rect = QRect()
+        self._surface_rect = QRect()
+        self._surface_path = QPainterPath()
+        self._main_bubble_path = QPainterPath()
+        self._breath_paths: list[QPainterPath] = []
+        self._breath_image_rect = QRectF()
+        self._breath_image_clip_path = QPainterPath()
+        self._standard_image_rect = QRectF()
+        self._water_fill = ""
+        self._water_start_ratio = 0.0
+        self._highlight_width_ratios = (0.0, 0.0)
+        self._breath_scale = 1.0
+        self._shadow_alpha = 18
+        self._tail_base = (QPointF(), QPointF())
+        self._tail_tip = QPointF()
+        # F-PERF P2：表面几何/路径的输入签名缓存。跟随场景 30Hz 每拍一次
+        # ``reposition``，此前每拍重建 QPainterPath（addRoundedRect + 三角尾巴 +
+        # ``united().simplified()`` 布尔运算）并 ``update()`` 整窗重绘三层阴影路径。
+        # 签名覆盖全部绘制输入（样式/形态/局部矩形/表面框/尾巴顶点/配图）：签名
+        # 不变 = 像素逐位不变 → 跳过重建与重绘；任一变化照旧重建。
+        self._surface_geometry_key: tuple | None = None
+        self._breath_geometry_key: tuple | None = None
+        self._breath_geometry_pending = False
+        # 上一次真实落位用的 (锚点整数矩形, 窗口尺寸)：跟随拍重复来同一锚点时
+        # 直接跳过整条放置链（不动窗、不算可用区、不碰几何）。
+        self._placed_follow_key: tuple[QRect, QSize] | None = None
+        self._shadow_offset_y = 2
+        # QPainter has no cheap cross-platform blur for a translucent tool
+        # window. Several restrained outline layers produce a softer, more
+        # stable shadow than the old single dark halo without a graphics effect.
+        self._shadow_layers = (
+            (4.0, 6, 1.5),
+            (2.5, 10, 1.25),
+            (1.0, 18, 1.0),
+        )
+        self._content_kind = "text"
+        self._raw_text = ""
+        # 多行模式：保留调用方写好的换行（如"标题一行 + 内容一行"）。
+        # 由 show_text 的 subtitle 是否有内容推导，避免为它增加公开参数。
+        self._multi_line = False
+        # 标题优先模式：标题放在最上方且与正文同字号（歌词气泡用）。
+        self._title_first = False
+        # 本次显示是否已经锁过宽度（同一首歌的后续刷新沿用同一宽度）。
+        self._width_locked = False
+        # 锁宽时真正沿用的列宽：在「同首歌第一句」（未锁宽的 title_first
+        # 显示）时记下，后续锁宽句复用。不逐句重算——否则每换一句歌词
+        # 气泡宽度就变一次，视觉上一直在跳。
+        self._locked_column: int | None = None
+        # 与锁宽配套的锁高（行数）：换句时歌词 1 行/2 行反复横跳会让气泡
+        # 顶边一跳一跳（底边锚着鱼头顶，高度一变顶边就动）。行数只单向
+        # 往大涨，涨过一次就稳在那，整首歌不再随句子长短上下伸缩。
+        self._locked_lines: int | None = None
+        self._source_pixmap = QPixmap()
+        self._pet_scale: float | None = None
+        self._image_scale: float = 1.0
+        self._text_scale: float = 1.0
+        self.set_style(style_id)
+        self._hide_timer = QTimer(self)
+        self._hide_timer.setSingleShot(True)
+        self._hide_timer.timeout.connect(self.hide)
+
+    @property
+    def style_id(self) -> str:
+        return self._style_id
+
+    @property
+    def text_scale(self) -> float:
+        """当前文字缩放系数（1.0 = 默认，与旧版逐像素一致）。"""
+        return self._text_scale
+
+    def set_text_scale(self, scale: float) -> None:
+        """设置气泡文字缩放系数（配置键 bubble_text_scale，百分比/100）。
+
+        与 ``set_style`` 同类的注入 seam：气泡自己持有系数，所有 ``show_text``
+        调用点无需改签名。作用面是**文字气泡**（标准 + 呼吸形态）：列宽、换行
+        预算、label 尺寸与字号用同一个系数，整体等比放大——只放字号会让长行
+        超出列宽被 label 右边界切掉。配图气泡的尺寸另有 ``image_scale``。
+        """
+        value = clamp_bubble_text_scale(scale)
+        if value == self._text_scale:
+            return
+        self._text_scale = value
+        # 字号写在样式表里，必须重挂一次才会进 label.font()；懒重挂 ——
+        # 样式表没变时 setStyleSheet 会短路，这里显式重挂保证换系数立即生效。
+        self.set_style(self._style_id)
+
+    def set_style(self, style_id: str) -> None:
+        self._style_id = style_id if style_id in BUBBLE_STYLE_PRESETS else "classic_top"
+        self._preset = BUBBLE_STYLE_PRESETS[self._style_id]
+        if self._preset.get("shape") == "breath_bubble":
+            self._layout.setAlignment(self.label, Qt.AlignmentFlag.AlignCenter)
+            self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.setMinimumSize(0, 0)
+            self.setMaximumSize(16777215, 16777215)
+            self._water_fill = "#d9f2fb"
+            self._shadow_alpha = 0
+        else:
+            self._layout.setContentsMargins(13, 10, 13, 17)
+            self._layout.setAlignment(
+                self.label, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+            )
+            self._subtitle_label.setContentsMargins(0, 0, 0, 0)
+            self.label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+            self.setMinimumSize(0, 0)
+            self.setMaximumSize(16777215, 16777215)
+            self._water_fill = ""
+            self._shadow_alpha = 18
+        self.label.setStyleSheet(
+            "QLabel#pet-speech-label { background: transparent; border: none; padding: 0; "
+            f"color: {self._preset['foreground']}; "
+            f"font-size: {scale_bubble_font_px(BUBBLE_BODY_FONT_PX, self._text_scale)}px; }}"
+        )
+        self._subtitle_label.setStyleSheet(
+            "QLabel#pet-speech-subtitle { background: transparent; border: none; padding: 0; "
+            f"color: {self._preset['foreground']}; "
+            f"font-size: {scale_bubble_font_px(BUBBLE_TITLE_FONT_PX if self._title_first else BUBBLE_SUBTITLE_FONT_PX, self._text_scale)}px; }}"
+        )
+        self._subtitle_label.setMaximumWidth(self._subtitle_width_floor())
+        self._page_indicator.setStyleSheet(
+            "QLabel#pet-page-indicator { background: transparent; border: none; padding: 0; "
+            f"color: {self._preset['foreground']}; "
+            f"font-size: {scale_bubble_font_px(BUBBLE_SUBTITLE_FONT_PX, self._text_scale)}px; }}"
+        )
+        self._surface_geometry_key = None
+        self._breath_geometry_key = None
+        self._placed_follow_key = None
+        if self.isVisible() and not self._anchor_rect.isNull():
+            self.reflow(self._anchor_rect, pet_scale=self._pet_scale)
+        self.update()
+
+    def _subtitle_width_floor(self) -> int:
+        """副标题宽度下限（= 基础文本列宽 × 气泡文字大小）。"""
+        return int(round(BUBBLE_TEXT_COLUMN * self._text_scale))
+
+    def _subtitle_shown(self) -> bool:
+        """副标题当前是否参与布局（hide 掉/空文本的 label 不占高度）。"""
+        return (not self._subtitle_label.isHidden()
+                and bool(self._subtitle_label.text().strip()))
+
+    def _sync_subtitle_max_width(self, label_width: int, column: int | None = None) -> None:
+        """副标题宽度上限对齐气泡真实内宽（issue #216）。
+
+        QLabel 自带一个宽度上限（防长副标题把交互气泡撑到聊天窗宽），但 Qt 在
+        **按高度定尺寸**时用的是「未夹取」的宽度算行数，而布局与真正绘制按上限
+        夹取——气泡一宽过上限（「气泡文字大小」放大，或长正文把列宽撑开），副标题
+        就多出一行、高度预算少一行：末行被自己的 label 裁掉，气泡也跟着矮一截。
+        上限至少抬到正文 label 宽度（两端同口径，这一条是硬要求）；上限的另一头是
+        本次气泡实际使用的文本列宽 ``column``——正文窄时保持原上限，交互气泡的
+        列宽未缩放，因此长副标题也不会把它撑到聊天窗宽。
+
+        ``column`` 为 None（呼吸泡：内宽由画布推出）时只按缩放后的基础列宽取上限。
+        """
+        floor = self._subtitle_width_floor()
+        if column is not None:
+            floor = min(floor, int(column))
+        self._subtitle_label.setMaximumWidth(max(int(label_width), floor))
+
+    def _configure_breath_content(
+        self,
+        anchor_rect: QRect,
+        pet_scale: float | None,
+    ) -> None:
+        base_size = (
+            breath_bubble_size_for_scale(pet_scale)
+            if pet_scale is not None
+            else breath_bubble_size_for_anchor(anchor_rect)
+        )
+        # 内容缩放系数按形态选：配图吃「配图大小」，文字吃「气泡文字大小」。
+        content_scale = (
+            self._image_scale if self._content_kind == "image" else self._text_scale
+        )
+        if content_scale != 1.0:
+            base_size = QSize(
+                int(base_size.width() * content_scale),
+                int(base_size.height() * content_scale),
+            )
+        bubble_size = self._breath_size_for_content(base_size)
+        bubble_size, label_height = self._breath_size_for_subtitle(bubble_size)
+        self._breath_scale = bubble_size.width() / 240.0
+        if self._content_kind == "image":
+            self._layout.setContentsMargins(
+                round(bubble_size.width() * 0.15),
+                round(bubble_size.height() * 0.16),
+                round(bubble_size.width() * 0.20),
+                round(bubble_size.height() * 0.18),
+            )
+        else:
+            self._layout.setContentsMargins(*self._breath_text_margins(bubble_size))
+        margins = self._layout.contentsMargins()
+        label_width = max(
+            92, bubble_size.width() - margins.left() - margins.right()
+        )
+        if label_height is None:      # 无副标题/配图：旧口径（正文盒吃满内高）
+            label_height = self._breath_label_height(
+                bubble_size.height() - margins.top() - margins.bottom(),
+                label_width, bubble_size,
+            )
+        self._sync_subtitle_max_width(label_width)
+        # 有机轮廓在底部两角向内收，左对齐的副标题最后一行会贴到轮廓外沿
+        # （issue #216 的「跨到气泡轮廓外」——文字落在透明区，深色桌面上直接
+        # 看不见）。副标题文字列按轮廓弦收进，正文盒不动（正文居中，天然避让
+        # 两角）。
+        left_inset, right_inset = self._breath_subtitle_side_insets(bubble_size)
+        self._subtitle_label.setContentsMargins(left_inset, 0, right_inset, 0)
+        self.label.setFixedSize(label_width, label_height)
+        self.setFixedSize(bubble_size)
+        if self._content_kind == "image" and not self._source_pixmap.isNull():
+            # Paint the image on the parent below water/outline/highlights.
+            # QLabel children paint afterwards and used to cover those details.
+            self.label.setText("")
+            self.label.setPixmap(QPixmap())
+            self.label.hide()
+        else:
+            self.label.show()
+            self.label.setPixmap(QPixmap())
+            self.label.ensurePolished()
+            self.label.setText(elide_bubble_text(
+                QFontMetrics(self.label.font()),
+                self._pages[self._page_index] if self._pages else self._raw_text,
+                label_width,
+                bubble_max_lines(self._raw_text, keep_breaks=self._multi_line),
+                keep_breaks=self._multi_line,
+            ))
+
+    def _breath_subtitle_inset(self, canvas_width: int) -> int:
+        """呼吸泡副标题左右安全内边距的下限（画布尺寸等比换算）。
+
+        有机轮廓在底部两角向内收，这是参考画布上的观感基准；真正使用的内边距
+        由 ``_breath_subtitle_side_insets`` 按轮廓弦算出，取不到弦时退回这里。
+        """
+        return int(round(BREATH_SUBTITLE_SIDE_INSET * canvas_width / 240.0))
+
+    def _breath_text_margins(self, canvas: QSize) -> tuple[int, int, int, int]:
+        """文字内容的四边内边距（画布等比换算）：布局与副标题安全区同源。"""
+        scale = canvas.width() / 240.0
+        return (
+            round(28 * scale), round(56 * scale),
+            round(52 * scale), round(44 * scale),
+        )
+
+    def _breath_chord_at(self, canvas: QSize, row: float) -> tuple[int, int] | None:
+        """主泡轮廓在 ``row`` 这一行的弦：``(左端像素, 右端开区间)``；该行在轮廓外 = None。
+
+        取法是「路径 ∩ 水平细带」的包围盒——一次布尔运算换掉逐像素 ``contains``
+        （实测单次 0.036ms vs 0.60ms）。布尔运算会先展平曲线、细带又跨一两行，
+        包围盒与该行真实弦有 1px 级偏差（两侧各可宽出 ≤1.6px，局部也可能窄不到
+        1px），所以两端各让 2px 再用 ``contains`` 向内收到端点确实在轮廓内
+        （与逐像素扫描逐行等价：画布宽 120..640 的内盒全部 78905 行零差异）。
+        """
+        main = breath_main_bubble_path(canvas)
+        band = QPainterPath()
+        band.addRect(QRectF(0.0, row - 0.5, float(canvas.width()), 1.0))
+        bounds = main.intersected(band).boundingRect()
+        if bounds.isEmpty():
+            return None
+        # 两端各多让 2px 再向内收：收到「第一个/最后一个落在轮廓内的像素」，与扫描同解。
+        left = max(0, int(floor(bounds.left())) - 2)
+        right = min(canvas.width(), int(ceil(bounds.right())) + 2)
+        while left + 1 < right and not main.contains(QPointF(left + 0.5, row)):
+            left += 1
+        while left + 1 < right and not main.contains(QPointF(right - 0.5, row)):
+            right -= 1
+        if not (main.contains(QPointF(left + 0.5, row))
+                and main.contains(QPointF(right - 0.5, row))):
+            return None
+        return left, right
+
+    def _breath_subtitle_side_insets(self, canvas: QSize) -> tuple[int, int]:
+        """副标题文字列的左右安全内边距（逻辑像素）。
+
+        呼吸泡的轮廓在底部两角向内收，而布局四边内边距相对轮廓是偏的（主泡
+        矩形在画布内靠左），同一个内边距在左右两侧的含义并不相同；固定参考值
+        只对某一种字体度量成立——换字体（Linux 的 Noto CJK 行高与字宽和
+        Windows 不同）副标题末行就会探进右下角「主泡与副泡之间」的透明缝，
+        深色桌面上直接看不见（issue #216 的①③，CI 上 32/49 像素）。
+
+        这里直接取主泡轮廓在**副标题文字底行**处的弦：文字列落在弦内，QLabel
+        又按自身矩形裁切，墨迹就不可能画到轮廓外。文字底行取布局内盒底边——
+        副标题吃掉正文盒让位后的剩余高度、贴底排（正文盒占满剩余空间时两者
+        相等；正文盒触底撑开时文字居中，取内盒底边只会更保守）。
+        """
+        margins = self._breath_text_margins(canvas)
+        base = self._breath_subtitle_inset(canvas.width())
+        chord = self._breath_chord_at(canvas, float(canvas.height() - margins[3]))
+        if chord is None:
+            # 该行整行落在轮廓外（画布过小）：退回参考内边距，不制造负文本列。
+            return base, base
+        left_edge, right_edge = chord
+        clearance = BREATH_SUBTITLE_SIDE_CLEARANCE
+        left = max(base, int(round(left_edge + clearance - margins[0])))
+        right = max(base, int(round(
+            (canvas.width() - margins[2]) - (right_edge - clearance)
+        )))
+        return left, right
+
+    def _breath_subtitle_reserve(self, label_width: int, canvas: QSize) -> int:
+        """副标题要从正文盒里让出的高度（行距 + 它自己的行高）；无副标题 = 0。
+
+        必须用正文 label 宽度量：副标题落到布局里拿到的就是这个宽度
+        （``heightForWidth`` 自己会扣掉左右内边距，安全内边距先设好再量）。
+        """
+        if not self._subtitle_shown():
+            return 0
+        left, right = self._breath_subtitle_side_insets(canvas)
+        self._subtitle_label.setContentsMargins(left, 0, right, 0)
+        self._sync_subtitle_max_width(label_width)
+        self._subtitle_label.ensurePolished()
+        # 标题态（歌词歌名）会关掉 wordWrap，此时 heightForWidth 返回 -1，
+        # 退回 sizeHint：不能让「-1」把副标题的预留高度算成 0。
+        sub_height = self._subtitle_label.heightForWidth(max(1, label_width))
+        if sub_height < 0:
+            sub_height = self._subtitle_label.sizeHint().height()
+        return self._layout.spacing() + sub_height
+
+    def _breath_label_height(self, inner: int, label_width: int, canvas: QSize) -> int:
+        """呼吸泡正文盒高度（旧口径）：吃满内高，下限 ``BREATH_LABEL_MIN_H``。
+
+        只在「没有副标题」时用到（有副标题时 ``_breath_size_for_subtitle`` 已经把
+        让位后的盒高算好并返回）。这里仍减去副标题预留量，是为了配图/无副标题路径
+        复用同一出处、不出现第二套公式。
+        """
+        return max(BREATH_LABEL_MIN_H,
+                   inner - self._breath_subtitle_reserve(label_width, canvas))
+
+    def _breath_size_for_subtitle(self, bubble_size: QSize) -> tuple[QSize, int | None]:
+        """把副标题的行高算进呼吸泡画布高度（issue #216）。
+
+        呼吸泡是宽高比锁定的画布（240:195），正文盒按画布取剩余空间：没有
+        副标题时这是对的，带上副标题后正文盒先把内高吃满、副标题只能吃边角，
+        字体一放大或正文一短，副标题末行就被自己的 label 裁掉（实机报告：
+        峰谷副标题第二行被裁）。
+
+        这里把「正文盒 + 副标题」当一个整体做高度预算：先把副标题的高度从
+        正文盒里让出来，正文盒退到下限（``BREATH_LABEL_MIN_H``）仍不够时按同一
+        比例放大画布——等比缩放 ⇒ 水泡轮廓形状不变，只是整体大一圈。
+
+        宽高比关系：文字内高 = 画布高 − (56+44) × 画布高/195 = 画布高 × 95/195。
+        返回 ``(画布尺寸, 正文盒高度)``；无副标题/配图气泡原样返回
+        ``(原尺寸, None)``（调用方按旧口径自己算正文盒，零行为变化）。
+        调用期间会按候选画布尺寸重设文字内边距（调用方随后按最终画布尺寸再设一次，
+        两处同源、不会分叉）。
+        """
+        if self._content_kind != "text" or not self._subtitle_shown():
+            return bubble_size, None
+        size = QSize(bubble_size)
+        label_height = BREATH_LABEL_MIN_H
+        for _ in range(3):
+            self._layout.setContentsMargins(*self._breath_text_margins(size))
+            margins = self._layout.contentsMargins()
+            label_width = max(92, size.width() - margins.left() - margins.right())
+            inner = size.height() - margins.top() - margins.bottom()
+            reserve = self._breath_subtitle_reserve(label_width, size)
+            label_height = max(BREATH_LABEL_MIN_H, inner - reserve)
+            if label_height + reserve <= inner:
+                return size, label_height
+            # 画布放大后内宽变宽 → 副标题行数可能变少：迭代两三次即收敛。
+            # 放大同样受呼吸泡画布上限约束（与 _breath_size_for_content 同源）：
+            # 超长副标题不允许把水泡顶成整屏，放不下时按既有口径裁切。
+            needed_inner = label_height + reserve
+            height = int(ceil(needed_inner * 195 / 95))
+            cap = int(round(BREATH_CANVAS_MAX_W * self._text_scale))
+            width = max(size.width(), min(cap, int(round(height * 240 / 195))))
+            grown = QSize(width, int(width * 195 / 240 + 0.5))
+            if grown == size:
+                break
+            size = grown
+        return size, label_height
+
+    def _breath_size_for_content(self, base_size: QSize) -> QSize:
+        """Grow the reference canvas when content needs more safe-area space.
+
+        ``base_size`` 已含用户内容缩放系数，本方法按同一系数推算内容安全区
+        （配图 150×122 目标框、文字加宽步进、320px 参考画布上限都乘系数），
+        否则放大后的内容会顶出呼吸气泡的安全区被裁。
+        """
+        width = base_size.width()
+        if self._content_kind == "image" and not self._source_pixmap.isNull():
+            target = self._source_pixmap.size()
+            target.scale(QSize(150, 122), Qt.AspectRatioMode.KeepAspectRatio)
+            # Image safe area occupies 65% of the width and 66% of the height.
+            width = max(
+                width,
+                ceil(target.width() / 0.65),
+                ceil(target.height() / (0.66 * 195 / 240)),
+            )
+        elif self._content_kind == "text":
+            # 宽度档按可见字符数走（去标记口径）：U+2060 连接符不可见，
+            # 数进长度会让气泡无端变宽 ~23%（PR #329 审查 F2）
+            length = _budget_length(normalize_bubble_text(self._raw_text))
+            if length > 24:
+                width += min(104, ceil((length - 24) / 8) * 14)
+        content_scale = (
+            self._image_scale if self._content_kind == "image" else self._text_scale
+        )
+        width = max(base_size.width(),
+                    min(int(round(BREATH_CANVAS_MAX_W * content_scale)), width))
+        return QSize(width, int(width * 195 / 240 + 0.5))
+
+    def _apply_window_flags(self) -> None:
+        """按 _host_on_top 重建独立窗口旗标；setWindowFlags 会隐窗，可见性要保住。"""
+        was_visible = self.isVisible()
+        flags = (
+            Qt.WindowType.Tool
+            | Qt.WindowType.FramelessWindowHint
+            # 气泡只是状态提示，在所有平台都不应该成为键盘焦点窗口。
+            # WA_ShowWithoutActivating 在部分窗口系统上只是提示，而这个原生窗口
+            # flag 才是防止定时 show() 抢走其他应用输入光标的硬约束。
+            | Qt.WindowType.WindowDoesNotAcceptFocus
+        )
+        if self._host_on_top:
+            flags |= Qt.WindowType.WindowStaysOnTopHint
+        self.setWindowFlags(flags)
+        if was_visible:
+            self.show()
+
+    def set_host_on_top(self, on: bool) -> None:
+        """跟随宿主「桌面置顶」开关。capture 兼容模式是主窗子控件，无窗口旗标，跳过。"""
+        on = bool(on)
+        if on == self._host_on_top:
+            return
+        self._host_on_top = on
+        if self._capture_compat:
+            return
+        self._apply_window_flags()
+
+    def set_interactive(self, on: bool) -> None:
+        """开启后气泡可被鼠标点击（用于触发快速对话），默认全透明穿透。"""
+        self._interactive = bool(on)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, not self._interactive)
+
+    def set_capture_compat(self, on: bool, host: QWidget | None = None) -> None:
+        """直播捕获兼容：把气泡作为桌宠主窗的子内容渲染（issue #62）。
+
+        开启后气泡不再是独立 Tool 窗口，而成为主窗子控件；OBS/直播姬捕获
+        主窗时即可看到气泡。放置可用区从整个屏幕收窄为主窗矩形，避免子控件
+        越出主窗边界被裁掉。关闭后恢复原独立置顶 Tool 窗口形态。
+        """
+        on = bool(on)
+        if on == self._capture_compat:
+            return
+        if on and host is None:
+            return
+        was_visible = self.isVisible()
+        self._capture_compat = on
+        if on:
+            self._capture_host = host
+            self.setWindowFlags(Qt.WindowType.Widget)
+            self.setParent(host)
+        else:
+            self._capture_host = None
+            self.setParent(None)
+            self._apply_window_flags()
+            if _MAC:
+                self.setAttribute(Qt.WidgetAttribute.WA_MacAlwaysShowToolWindow, True)
+        if not self._anchor_rect.isEmpty():
+            self._place(self._anchor_rect)
+        if was_visible:
+            self.show()
+            if not on and not _MAC:
+                self.raise_()
+        else:
+            # 子模式重挂到主窗后，Qt 会随父窗显示把未显式隐藏的子控件一起显示；
+            # 启动期/无内容时不能因此冒出空白小气泡。
+            self.hide()
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        if self._interactive and event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def show_text(
+        self,
+        text: str,
+        anchor_rect: QRect,
+        duration_ms: int = 3200,
+        *,
+        pet_scale: float | None = None,
+        subtitle: str = "",
+        sticky: bool = False,
+        buttons: list[tuple[str, object]] | None = None,
+        title_first: bool = False,
+        width_locked: bool = False,
+    ) -> None:
+        """显示文本气泡。
+        ``title_first`` 会把 ``subtitle`` 放到正文上方并使用正文字号——
+        用于"歌名 + 歌词"这类以标题为主的场景；默认仍是副标题样式。
+
+        ``sticky=True`` 时不启动自动隐藏定时器，气泡一直停留直到上层调用
+        :meth:`dismiss`（用于「审批一直挂着直到审批结束」这类需要主动关闭的气泡）。
+        审批文案短、无需分页，sticky 时强制单页展示。
+
+        ``buttons`` 为 ``[(label, callback), ...]`` 时进入「交互气泡」模式：气泡内
+        排一行可点按钮（审批同意/拒绝、问题 A/B/C），点击即回调并把决策交还上层
+        （如回写 DSH）。交互气泡自动 sticky，且临时关闭鼠标穿透让按钮可点，
+        收起/隐藏时恢复穿透。
+        """
+        text = str(text).strip()
+        if not text:
+            return
+        interactive = bool(buttons)
+        # 交互提醒（如循环检测的三按钮弹窗）必须保持按钮和回调绑定。
+        # 动画/普通气泡偶尔会在之后尝试重绘同一窗口；若允许无按钮的
+        # show_text 覆盖这里，视觉上文字还在，但按钮已被 teardown。
+        if self._interactive_active and not interactive:
+            return
+        self._content_kind = "text"
+        self._raw_text = text
+        # 带 subtitle 的气泡是"标题 + 内容"结构，正文里可能自带换行，
+        # 必须保留（否则标题与首行会被折行拼接）。
+        self._multi_line = bool(str(subtitle or "").strip())
+        self._title_first = bool(title_first)
+        self._width_locked = bool(width_locked) and self._title_first
+        self._source_pixmap = QPixmap()
+        self._pet_scale = pet_scale
+        self._reset_paging()
+        subtitle = str(subtitle or "").strip()
+        if subtitle:
+            self._subtitle_label.setText(subtitle)
+            self._subtitle_label.show()
+            if self._title_first:
+                # 标题态：标题在上、字号 11px（比歌词略小，但仍是一行主角）。
+                # 两者都按「气泡文字大小」系数缩放（度量从 label.font() 读回，
+                # 与绘制同源，放大后不会切字）。
+                self.label.setStyleSheet(
+                    "QLabel#pet-speech-label { background: transparent; border: none; "
+                    f"padding: 0; color: {self._preset['foreground']}; "
+                    f"font-size: {scale_bubble_font_px(BUBBLE_BODY_FONT_PX, self._text_scale)}px; }}"
+                )
+                self._subtitle_label.setStyleSheet(
+                    "QLabel#pet-speech-subtitle { background: transparent; border: none; "
+                    f"padding: 0; color: {self._preset['foreground']}; "
+                    f"font-size: {scale_bubble_font_px(BUBBLE_TITLE_FONT_PX, self._text_scale)}px; }}"
+                )
+                # 短标题不换行：气泡宽度会被歌词带窄，若标题跟着折行就会断成
+                # 两行、很难看。先按实际字体量宽度——放得下就关掉换行（宁可让
+                # 气泡为标题让出宽度），真的超长才允许折行。
+                self._subtitle_label.ensurePolished()
+                title_metrics = QFontMetrics(self._subtitle_label.font())
+                width = title_metrics.horizontalAdvance(subtitle)
+                # 留出左右内边距（13px×2，随文字系数缩放）的余量再判断。
+                fit_width = bubble_column_for_text(subtitle, self._text_scale) - 26
+                self._subtitle_label.setWordWrap(width > fit_width)
+                self._layout.removeWidget(self._subtitle_label)
+                self._layout.insertWidget(0, self._subtitle_label)
+            else:
+                self._layout.removeWidget(self._subtitle_label)
+                self._layout.addWidget(self._subtitle_label)
+        else:
+            self._subtitle_label.setText("")
+            self._subtitle_label.hide()
+        self.label.show()
+        # 量文本前必须先让 label 落到最终字体上：样式表里的 font-size 只在
+        # polish 时写进 label.font()，若此时量到的还是旧字体，换行与绘制就
+        # 用了两套度量（行尾字会被 label 右边界切掉）。这里显式 polish 兜底。
+        self.label.ensurePolished()
+        if interactive:
+            # 交互气泡：不自动消失 + 显示按钮 + 临时关闭鼠标穿透
+            self._setup_buttons(buttons)
+            self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
+            self._interactive_active = True
+        else:
+            self._teardown_interactive()
+        duration_ms = self._layout_text_content(anchor_rect, sticky=sticky, duration_ms=duration_ms)
+        self.adjustSize()
+        self._place(anchor_rect)
+        self.show()
+        if not _MAC:
+            self.raise_()
+        if sticky or interactive:
+            # 审批等需主动关闭的气泡：不启动自动隐藏，由上层 dismiss() 收尾
+            self._hide_timer.stop()
+        else:
+            self._hide_timer.start(max(500, int(duration_ms)))
+
+    def _layout_text_content(self, anchor_rect: QRect, *, sticky: bool, duration_ms: int = 3200,
+                             preserve_paging: bool = False) -> int:
+        """Lay out existing text without replacing buttons or its dismissal timer."""
+        text = self._raw_text
+        subtitle = self._subtitle_label.text().strip()
+        pet_scale = self._pet_scale
+        interactive = self._interactive_active
+        self.label.ensurePolished()
+        metrics = QFontMetrics(self.label.font())
+        # 本次实际使用的文本列宽（呼吸泡为 None：内宽由画布推出），
+        # 供副标题宽度上限取「不与正文列宽打架」的口径。
+        column: int | None = None
+        if self._preset.get("shape") == "breath_bubble" and not interactive:
+            self._configure_breath_content(anchor_rect, pet_scale)
+            self._page_indicator.hide()
+        else:
+            # 自适应列宽：短文案维持 248px，长文案逐步放宽到 360px 上限
+            # （bubble_column_for_text），整体再乘「气泡文字大小」系数——审批/
+            # 提问气泡有自己的布局（按钮行 + 强制单页展示），保持既有列宽不动。
+            text_slack = max(1, int(round(BUBBLE_TEXT_SLACK * self._text_scale)))
+            column = (
+                BUBBLE_TEXT_COLUMN
+                if interactive or sticky
+                else self._column_for_text(text, anchor_rect)
+            )
+            if self._title_first:
+                if not self._width_locked or self._locked_column is None:
+                    # 未锁宽帧定列宽并记下，后续锁宽句复用——同首歌气泡宽度
+                    # 恒定，不逐句改宽。产品链路里这一帧通常是「取词中」的
+                    # 纯标题帧（歌词还没回来），所以实测列宽多为标题宽度；
+                    # 标题/正文取较长者只是兜底——首帧恰好已带歌词行时才用到。
+                    basis = text if len(text) >= len(subtitle) else subtitle
+                    self._locked_column = max(
+                        self._column_for_text(basis, anchor_rect),
+                        int(round(TITLE_FIRST_COLUMN * self._text_scale)),
+                    )
+                    # 重锁宽（新歌）时锁高一起作废，从新首句重新累计。
+                    self._locked_lines = None
+                column = self._locked_column
+            # 长文本分页：每页不超过 bubble_max_lines 行，自动翻页直到全文展示完，
+            # 底部显示圆点页码（● ○ ○）。每页停留按该页字数自适应，
+            # 末页多压一拍回首页停顿，总时长相应扩展。
+            # 换行预算必须与下面 bubble_label_size 用**同一个**列宽/余量：
+            # 两者一旦分叉（如放大后一处用旧列宽），label 会比真实行窄、行尾
+            # 那个字被切在边界上——看起来就像被气泡挡掉了。
+            pages = paginate_bubble_text(
+                metrics,
+                text,
+                bubble_wrap_width(column, text_slack),
+                bubble_max_lines(text, keep_breaks=self._multi_line),
+                keep_breaks=self._multi_line,
+            )
+            page_index = min(self._page_index, len(pages) - 1) if preserve_paging and pages else 0
+            display_text = pages[page_index] if pages else ""
+            if len(pages) > 1 and not sticky and not interactive:
+                dwells = page_dwells_ms(pages)
+                total_ms = max(duration_ms, sum(dwells))
+                remaining = self._page_timer.remainingTime() if preserve_paging else -1
+                self._stop_page_fade()
+                self._pages = pages
+                self._page_index = page_index
+                self._page_dwells = dwells
+                self._page_indicator.setText(page_dots(page_index, len(pages)))
+                self._page_indicator.show()
+                self._page_timer.start(max(1, remaining) if remaining >= 0 else dwells[page_index])
+                duration_ms = total_ms
+            else:
+                self._reset_paging()
+            self.label.setPixmap(QPixmap())
+            self.label.setText(display_text)
+            # 固定尺寸按真正会绘制的行计算（所有页里最长的一行 + 行数最多的一页），
+            # 翻页后 wordWrap=False 也不会裁字；详见 bubble_label_size 的说明。
+            if self._title_first:
+                # 歌词气泡：列宽取第一句定下的值（上面 _locked_column 逻辑），
+                # 从标题出场到整首歌结束宽度恒定，不随句子长短伸缩。
+                # 高度同理锁行数：底边锚在鱼头顶，行数一变顶边就跳——所以
+                # 行数只单向往大涨（_locked_lines），涨到本首歌最胖的一句后
+                # 彻底稳定；短句不再把气泡顶边拉回来。
+                line_count = max(
+                    (len(page.split("\n")) for page in pages), default=1
+                )
+                if self._locked_lines is None or line_count > self._locked_lines:
+                    self._locked_lines = line_count
+                self.label.setFixedSize(
+                    bubble_label_size(
+                        metrics, pages, column, text_slack,
+                        min_width=int(round(TITLE_FIRST_COLUMN * self._text_scale)),
+                        min_height=self._locked_lines * metrics.lineSpacing() + 2,
+                    )
+                )
+            else:
+                self.label.setFixedSize(
+                    bubble_label_size(metrics, pages, column, text_slack)
+                )
+        # 副标题宽度上限对齐刚定下的气泡内宽（issue #216）：不这样做时 Qt 的
+        # 定高口径（未夹取的宽）与布局/绘制口径（按上限夹取）会分叉，副标题多出
+        # 一行、末行被自己的 label 裁掉。呼吸泡路径已在 _configure_breath_content
+        # 内同步过（那里的 label 宽度是画布推出来的，column=None），此处幂等。
+        self._sync_subtitle_max_width(self.label.width(), column)
+        return duration_ms
+
+    def _setup_buttons(self, buttons: list[tuple[str, object]]) -> None:
+        """清空旧按钮并按元素重建按钮行（仅交互气泡用）。
+
+        元素除普通 ``(label, callback)`` 按钮外，还支持两类结构化行：
+        - ``("__header__", text)``：分支标题行（独占一行、加粗）——多分支问题
+          弹窗按分支分组展示的标题。
+        - ``("__hint__", text)``：灰色提示行（独占一行）——例如自由文本问题
+          「请到 DSH 界面输入文本回答」。
+        """
+        while self._button_layout.count():
+            item = self._button_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        self._interactive_buttons = []
+        for label, callback in buttons:
+            if label == SECTION_HEADER_LABEL:
+                header = QLabel(str(callback), self._button_row)
+                header.setObjectName("pet-speech-branch-header")
+                header.setWordWrap(True)
+                header.setFixedWidth(220)
+                header.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+                header.setStyleSheet(
+                    "QLabel { background: transparent; border: none;"
+                    " font-weight:600; font-size:11px; color:#2b3a4a;"
+                    " padding:2px 0 0 0; }"
+                )
+                self._button_layout.addWidget(header)
+                continue
+            if label == SECTION_HINT_LABEL:
+                hint = QLabel(str(callback), self._button_row)
+                hint.setObjectName("pet-speech-branch-hint")
+                hint.setWordWrap(True)
+                hint.setFixedWidth(220)
+                hint.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+                hint.setStyleSheet(
+                    "QLabel { background: transparent; border: none;"
+                    " font-size:10px; color:#7a8a9a; padding:1px 0 0 0; }"
+                )
+                self._button_layout.addWidget(hint)
+                continue
+            button_text = str(label)
+            btn = QPushButton(button_text, self._button_row)
+            btn.setObjectName("pet-speech-button")
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            # 选择/审批选项来自 Agent，单个选项可能远长于气泡的文本列。
+            # QPushButton 不会像 QLabel 一样自动换行，若直接使用 sizeHint，
+            # FlowLayout 会把整颗气泡撑宽，最终文字仍可能绘制到气泡外。
+            # 限制按钮宽度并在按钮内做省略，完整选项保留在 tooltip 中。
+            button_width = 220
+            btn.setMaximumWidth(button_width)
+            metrics = QFontMetrics(btn.font())
+            available_width = button_width - 24 - 2
+            btn.setText(metrics.elidedText(
+                button_text, Qt.TextElideMode.ElideRight, available_width
+            ))
+            btn.setToolTip(button_text)
+            btn.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
+            btn.setStyleSheet(
+                "QPushButton {"
+                " background:#ffffff; border:1px solid #c9d4e0; border-radius:11px;"
+                " padding:4px 12px; font-size:11px; color:#2b3a4a;"
+                "}"
+                "QPushButton:hover { background:#eef6ff; border-color:#8ab8e8; }"
+                "QPushButton:pressed { background:#dcebfa; }"
+            )
+            btn.clicked.connect(lambda _checked=False, cb=callback: self._on_interactive_click(cb))
+            self._interactive_buttons.append(btn)
+            self._button_layout.addWidget(btn)
+        self._button_row.show()
+
+    def _on_interactive_click(self, callback) -> None:
+        """交互按钮被点：先回调决策（上层清 _alert_current 并 dismiss），再隐藏收尾。
+
+        时序很关键：若先 hide() 会触发 hidden_signal → 上层 _on_speech_bubble_hidden
+        看到 _alert_current 还在会把审批气泡重新挂上，导致「点了同意/拒绝弹窗却不消失」。
+        先回调让上层完成 hide_bubble()/dismiss()，再隐藏收尾。
+
+        注意：callback() 内部通过 _resolve_interaction → resolve_alert →
+        _speech_bubble.dismiss() 已经关闭了当前气泡，并通过 _on_speech_bubble_hidden
+        → sticky restore 显示了下一个弹窗。此处不再调用 self.hide()——
+        否则会二次隐藏已替换为下一条内容的气泡，导致其按钮被 deleteLater 清除、
+        鼠标事件错乱（「第一个弹窗点击导致第二个弹窗也接收事件」）。
+        """
+        self._teardown_interactive()
+        self._hide_timer.stop()
+        try:
+            callback()
+        except Exception:
+            log.exception("交互气泡回调异常")
+
+    def _teardown_interactive(self) -> None:
+        """退出交互态：恢复鼠标穿透、清空按钮行。隐藏/收起时都必须调用。"""
+        if self._interactive_active:
+            self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+            self._interactive_active = False
+        while self._button_layout.count():
+            item = self._button_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        self._interactive_buttons = []
+        self._button_row.hide()
+
+    def dismiss(self) -> None:
+        """立即关闭当前气泡（停掉自动隐藏/翻页定时器）。供 sticky 气泡主动收尾。"""
+        self._hide_timer.stop()
+        self._page_timer.stop()
+        self._reset_paging()
+        self._teardown_interactive()
+        self.hide()
+
+    def hideEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
+        """气泡被隐藏（超时 / dismiss / 父窗口隐藏）时通知上层。"""
+        super().hideEvent(event)
+        self._stop_page_fade()
+        self._teardown_interactive()
+        self.hidden_signal.emit()
+
+    def _reset_paging(self) -> None:
+        """停止自动翻页并隐藏页码指示（单页内容/图片/换内容时调用）。"""
+        self._page_timer.stop()
+        self._stop_page_fade()
+        self._pages = []
+        self._page_index = 0
+        self._page_dwells = []
+        self._page_indicator.setText("")
+        self._page_indicator.hide()
+
+    def _label_opacity_effect(self) -> QGraphicsOpacityEffect:
+        """懒创建 label 透明度效果（仅分页翻页时用到，单页气泡零开销）。"""
+        if self._label_opacity is None:
+            self._label_opacity = QGraphicsOpacityEffect(self.label)
+            self._label_opacity.setOpacity(1.0)
+            self.label.setGraphicsEffect(self._label_opacity)
+        return self._label_opacity
+
+    def _stop_page_fade(self) -> None:
+        """打断进行中的翻页动画并把透明度复位（隐藏/换内容/连翻时兜底）。"""
+        anim, self._page_fade = self._page_fade, None
+        if anim is not None:
+            anim.stop()  # stop() 不触发 finished，换字回调不会执行
+        if self._label_opacity is not None:
+            self._label_opacity.setOpacity(1.0)
+
+    def _flip_to_page(self, index: int) -> None:
+        """翻到指定页：短淡出 → 换文本与页码 → 淡入。"""
+        self._stop_page_fade()
+        effect = self._label_opacity_effect()
+        fade_out = QPropertyAnimation(effect, b"opacity", self)
+        fade_out.setDuration(PAGE_FADE_OUT_MS)
+        fade_out.setStartValue(1.0)
+        fade_out.setEndValue(0.0)
+
+        def _swap_and_fade_in() -> None:
+            if self._page_fade is not fade_out:
+                return  # 已被 _stop_page_fade 打断
+            text = self._pages[index]
+            if self._preset.get("shape") == "breath_bubble":
+                text = elide_bubble_text(QFontMetrics(self.label.font()), text, self.label.width(),
+                                        bubble_max_lines(text, keep_breaks=self._multi_line),
+                                        keep_breaks=self._multi_line)
+            self.label.setText(text)
+            self._page_indicator.setText(page_dots(index, len(self._pages)))
+            fade_in = QPropertyAnimation(effect, b"opacity", self)
+            fade_in.setDuration(PAGE_FADE_IN_MS)
+            fade_in.setStartValue(0.0)
+            fade_in.setEndValue(1.0)
+
+            def _fade_in_done() -> None:
+                if self._page_fade is fade_in:
+                    self._page_fade = None
+
+            fade_in.finished.connect(_fade_in_done)
+            self._page_fade = fade_in
+            fade_in.start(QPropertyAnimation.DeletionPolicy.DeleteWhenStopped)
+
+        fade_out.finished.connect(_swap_and_fade_in)
+        self._page_fade = fade_out
+        fade_out.start(QPropertyAnimation.DeletionPolicy.DeleteWhenStopped)
+
+    def _on_page_timeout(self) -> None:
+        """自动翻到下一页；最后一页展示完后由 _hide_timer 收尾隐藏。"""
+        if not self._pages or self._page_index >= len(self._pages) - 1:
+            self._page_timer.stop()
+            return
+        self._page_index += 1
+        if self._content_kind == "text":
+            self._flip_to_page(self._page_index)
+            if self._page_index < len(self._page_dwells):
+                self._page_timer.start(self._page_dwells[self._page_index])
+
+    def show_image(
+        self,
+        image_path: str | Path,
+        anchor_rect: QRect,
+        duration_ms: int = 3200,
+        *,
+        pet_scale: float | None = None,
+        image_scale: float = 1.0,
+        pixmap: QPixmap | None = None,
+    ) -> bool:
+        # pixmap 直供（调用方已解码/预热）：跳过同步磁盘读+解码——GUI 线程
+        # 上的 QPixmap(str(path)) 是大图 100ms+ 级慢帧源（py-spy 实测）。
+        if pixmap is None:
+            pixmap = QPixmap(str(image_path))
+        if pixmap.isNull():
+            return False
+        self._content_kind = "image"
+        self._raw_text = ""
+        self._source_pixmap = pixmap
+        self._pet_scale = pet_scale
+        # 用户可调的配图显示尺寸（self_talk_image_scale，百分比/100），双保险钳位
+        self._image_scale = max(0.5, min(3.0, float(image_scale)))
+        self._reset_paging()
+        self._subtitle_label.setText("")
+        self._subtitle_label.hide()
+        self._layout_image_content(anchor_rect)
+        self.adjustSize()
+        self._place(anchor_rect)
+        self.show()
+        if not _MAC:
+            self.raise_()
+        self._hide_timer.start(max(500, int(duration_ms)))
+        return True
+
+    def _layout_image_content(self, anchor_rect: QRect) -> None:
+        pixmap = self._source_pixmap
+        pet_scale = self._pet_scale
+        if self._preset.get("shape") == "breath_bubble":
+            self._configure_breath_content(anchor_rect, pet_scale)
+        else:
+            box = QSize(int(SELF_TALK_IMAGE_BOX_W * self._image_scale),
+                        int(SELF_TALK_IMAGE_BOX_H * self._image_scale))
+            target = pixmap.size()
+            target.scale(box, Qt.AspectRatioMode.KeepAspectRatio)
+            target.setWidth(max(int(96 * self._image_scale), target.width()))
+            target.setHeight(max(int(64 * self._image_scale), target.height()))
+            self.label.setFixedSize(target)
+            self.label.setText("")
+            self.label.show()
+            # Keep QLabel only as a layout placeholder. Parent painting uses
+            # the original source, avoiding QLabel's DPR=1 pixmap normalization.
+            self.label.setPixmap(QPixmap())
+
+    def reflow(self, anchor_rect: QRect, *, pet_scale: float | None = None) -> None:
+        """Resize current content after a pet scale change, then reposition it."""
+        if pet_scale is not None:
+            self._pet_scale = float(pet_scale)
+        self.setMinimumSize(0, 0)
+        self.setMaximumSize(16777215, 16777215)
+        if self._content_kind == "image":
+            self._layout_image_content(anchor_rect)
+        elif self._raw_text:
+            self._layout_text_content(anchor_rect, sticky=not self._hide_timer.isActive(),
+                                      preserve_paging=True)
+        self.adjustSize()
+        self._place(anchor_rect, animate=False)
+
+    def reposition(self, anchor_rect: QRect) -> None:
+        # 鱼移动触发的跟随：直移零延迟（连续跟随走动画会拖尾滞后）。
+        if not self.isVisible():
+            return
+        # F-PERF P2a：锚点整数矩形与窗口尺寸都没变 = 上一次落位仍然成立，
+        # 整条放置链（可用区计算 + 目标矩形 + move + 几何重建）都可以跳过
+        # ——气泡原地不动就不动窗、不重绘。慢速移动时锚点（body_rect 整数化）
+        # 每拍都可能重复，这一跳省下的是每次一次整窗重绘。
+        anchor_rect = QRect(anchor_rect)
+        key = (anchor_rect, QSize(self.size()))
+        if key == self._placed_follow_key:
+            return
+        self._place(anchor_rect, animate=False)
+
+    def _available_geometry(self, anchor_rect: QRect) -> QRect | None:
+        """气泡可用区：普通模式取所在屏幕，直播捕获子模式收窄为主窗矩形。
+
+        捕获子模式下气泡是主窗子控件，只有落在主窗矩形内才不会被裁掉；
+        ``_place`` 与自适应列宽共用同一口径。
+        """
+        screen = QGuiApplication.screenAt(anchor_rect.center()) or QGuiApplication.primaryScreen()
+        if screen is None:
+            return None
+        host = self._capture_host if self._capture_compat else None
+        if host is not None and not host.geometry().isEmpty():
+            return host.geometry()
+        return screen.availableGeometry()
+
+    def _column_for_text(self, text: str, anchor_rect: QRect) -> int:
+        """文案自适应列宽（含「气泡文字大小」系数），再按可用区宽度收敛。
+
+        返回值必须同时是**分页换行预算**与**label 尺寸上限**的来源：`bubble_label_size`
+        会把 label 宽度夹到 ``min(column, 最长行 + slack)``，所以只要这里的 column
+        比可用区能装下的还宽、而最长行又真的很长，label 就会被同一次夹取压到可用区宽度
+        ——换行却按更宽的 column 做过，行尾那个字随即被切掉（真机 300% 实测复现：
+        column 744 / label 246 / 行尾截断）。
+
+        因此上限取 ``min(缩放后的列宽, 可用区能装下的宽度)``：宁可列窄一点也不越界，
+        更不制造「换行口径 ≠ label 口径」的错位。基础列宽 248px 在缩放后**不设下限**
+        （可用区装不下时以可用区为准；那时字号依旧按用户设定放大，只是每行少几个字）。
+        """
+        column = bubble_column_for_text(text, self._text_scale)
+        avail = self._available_geometry(anchor_rect)
+        if avail is None:
+            return column
+        margins = self._layout.contentsMargins()
+        chrome = margins.left() + margins.right()
+        feasible = avail.width() - chrome - 8
+        return max(1, min(column, feasible))
+
+    def _place(self, anchor_rect: QRect, *, animate: bool = True) -> None:
+        host = self._capture_host if self._capture_compat else None
+        avail = self._available_geometry(anchor_rect)
+        if avail is None:
+            return
+        # Image breath bubbles hide the QLabel because the parent paints the
+        # clipped image below its decorations. Their sizeHint therefore only
+        # contains layout margins; position the real fixed-size window instead.
+        size = self.size()
+        rect = bubble_rect_for_anchor(anchor_rect, size, avail, self._preset["placement"])
+        if rect.height() > avail.height():
+            # 文字放大到足以让气泡高过整块可用区时，bubble_rect_for_anchor 的
+            # 夹取会退化成把窗口推出屏幕上沿（上下界交叉）。宁可顶边贴住可用区
+            # 上沿，也不让内容被屏幕下边界切掉——超高部分由分页/列宽收敛承担。
+            rect.moveTop(avail.top())
+        if self._preset.get("shape") == "breath_bubble" and rect.bottom() < anchor_rect.top():
+            # The reference canvas deliberately leaves transparent space below
+            # the smallest detached bubble.  Position by the painted contour,
+            # not by the transparent QWidget edge, otherwise that inset and the
+            # generic 12 px placement gap add up to a visibly disconnected
+            # thought bubble after adaptive down-scaling.
+            self._build_breath_bubble_geometry(self.rect())
+            visual_bottom = self._surface_path.boundingRect().bottom()
+            visual_gap = 7
+            top = int(round(anchor_rect.top() - visual_gap - visual_bottom))
+            top = min(max(top, avail.top()), avail.bottom() - rect.height() + 1)
+            rect.moveTop(top)
+        self._anchor_rect = QRect(anchor_rect)
+        if host is not None:
+            target = host.mapFromGlobal(rect.topLeft())
+        else:
+            target = rect.topLeft()
+        if animate:
+            self._move_smooth(target)
+        else:
+            # 跟随鱼移动（moveEvent/缩放）直移：跟随场景每帧都在来新位置，
+            # 走动画会不停重启、气泡永远拖着延迟尾巴，用户实测"跟不上"。
+            anim = self._pos_anim
+            if anim is not None:
+                anim.stop()
+            self.move(target)
+        # F-PERF P2a：记录本次落位（锚点 + 当时的窗口尺寸）供跟随拍去重。
+        # 所有放置路径（show/reflow/跟随）都在这里收口，故该记录恒等于
+        # "控件当前所在位置对应的落位参数"。
+        self._placed_follow_key = (QRect(anchor_rect), QSize(self.size()))
+        self._update_surface_geometry(rect)
+
+    def _move_smooth(self, pos: QPoint) -> None:
+        """移动到目标点：已显示时走 260ms 缓动滑动，未显示时直接落位。
+
+        歌词气泡每秒重放 / 锚点微修过去是瞬移，视觉上"一帧一帧跳"。
+        改为滑动后：换句的细微修正变成缓慢的漂移（实测 120ms 偏快，
+        260ms 才有"被轻轻推动"的慵懒感）。仅用于离散修正；连续跟随
+        （拖动/游走）由 _place(animate=False) 直移，不经过这里。
+        首次显示（尚未 visible）直接落位，避免气泡从旧位置"飞过来"。
+        """
+        if not self.isVisible():
+            # 隐藏中可能有残留动画（dismiss/hide 不停表）：重显示前必须停掉，
+            # 否则它会继续 tick 把控件拽回旧 endValue（实审 P2-2 探针实测）。
+            if self._pos_anim is not None:
+                self._pos_anim.stop()
+            self.move(pos)
+            return
+        if self.pos() == pos:
+            return
+        anim = self._pos_anim
+        if anim is None:
+            anim = QPropertyAnimation(self, b"pos", self)
+            anim.setDuration(260)
+            anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+            self._pos_anim = anim
+        anim.stop()
+        anim.setStartValue(self.pos())
+        anim.setEndValue(pos)
+        anim.start()
+
+    def _image_paint_key(self) -> tuple:
+        """配图绘制的输入签名（配图内容 + label 几何）；纯文字气泡返回空元组。
+
+        配图由**父控件** paintEvent 直接绘制（QLabel 只是占位），故换图/挪 label
+        都必须让几何缓存失效；纯文字由 QLabel 自绘，不参与父控件绘制，不进签名。
+        ``QPixmap.cacheKey()`` 随每次 ``_source_pixmap`` 赋值变化（show_image 换图
+        必然失效），且是单调递增的 Qt 侧唯一键（不依赖对象地址复用）。
+        """
+        pm = self._source_pixmap
+        if self._content_kind != "image" or pm.isNull():
+            return ()
+        label = self.label.geometry()
+        return (pm.cacheKey(), label.x(), label.y(), label.width(), label.height())
+
+    def _update_surface_geometry(self, global_rect: QRect) -> None:
+        local = self.rect()
+        if self._preset.get("shape") == "breath_bubble":
+            self._build_breath_bubble_geometry(local)
+            # F-PERF P2b：几何没重建（纯平移）就不必重绘——窗口被 WM 搬走，
+            # 控件自身像素没变。
+            if self._breath_geometry_pending:
+                self._breath_geometry_pending = False
+                self.update()
+            return
+        # 用目标矩形（而非 self 当前位置）换算锚点局部坐标：_place 先起滑动
+        # 动画再算几何，此刻窗口还停在旧位置，mapFromGlobal 会把尾巴算歪且
+        # 之后再无重算（实审 P1：偏移实测达 108px）。
+        anchor_center = self._anchor_rect.center() - global_rect.topLeft()
+        if global_rect.bottom() < self._anchor_rect.top():
+            self._surface_rect = local.adjusted(4, 3, -4, -10)
+            tip_x = min(max(anchor_center.x(), 20), local.width() - 20)
+            self._tail_base = (
+                QPointF(tip_x - 6, self._surface_rect.bottom() - 2),
+                QPointF(tip_x + 6, self._surface_rect.bottom() - 2),
+            )
+            self._tail_tip = QPointF(tip_x, local.bottom() - 4)
+        elif global_rect.left() > self._anchor_rect.right():
+            self._surface_rect = local.adjusted(10, 3, -4, -4)
+            tip_y = min(max(anchor_center.y(), 18), local.height() - 18)
+            self._tail_base = (
+                QPointF(self._surface_rect.left() + 2, tip_y - 6),
+                QPointF(self._surface_rect.left() + 2, tip_y + 6),
+            )
+            self._tail_tip = QPointF(4, tip_y)
+        elif global_rect.right() < self._anchor_rect.left():
+            self._surface_rect = local.adjusted(4, 3, -10, -4)
+            tip_y = min(max(anchor_center.y(), 18), local.height() - 18)
+            self._tail_base = (
+                QPointF(self._surface_rect.right() - 2, tip_y - 6),
+                QPointF(self._surface_rect.right() - 2, tip_y + 6),
+            )
+            self._tail_tip = QPointF(local.right() - 4, tip_y)
+        else:
+            # 重叠兜底：capture 子模式（stream_capture_mode）下气泡只能落在主窗
+            # 矩形内，空间不足时会压在桌宠身上，此时上面四个"完全不重叠"的分支
+            # 全部失效、一律走这里。改用中心判定，保证三角指向桌宠所在的一侧，
+            # 而不是无条件朝上（实机表现为「三角指向了桌宠的反方向」）。
+            # 这里 anchor_center 与 local 都是本窗口局部坐标，不存在坐标系混用。
+            # 按**主导方向**选边：只看 y 会把"桌宠在侧边"误判成上下
+            # （实测：桌宠贴屏幕顶且气泡被挤到它右侧时，anchor 中心 y 偏下，
+            # 旧逻辑判成"朝下"，而桌宠其实在右边）。横向差更大就走左右。
+            dx = anchor_center.x() - local.center().x()
+            dy = anchor_center.y() - local.center().y()
+            if abs(dx) > abs(dy):
+                # 主导方向是横向
+                tip_y = min(max(anchor_center.y(), 18), local.height() - 18)
+                if dx > 0:
+                    # 桌宠在气泡**右侧**：尾巴从右边探出朝右
+                    self._surface_rect = local.adjusted(4, 3, -10, -4)
+                    self._tail_base = (
+                        QPointF(self._surface_rect.right() - 2, tip_y - 6),
+                        QPointF(self._surface_rect.right() - 2, tip_y + 6),
+                    )
+                    self._tail_tip = QPointF(local.right() - 4, tip_y)
+                else:
+                    # 桌宠在气泡**左侧**：尾巴从左边探出朝左
+                    self._surface_rect = local.adjusted(10, 3, -4, -4)
+                    self._tail_base = (
+                        QPointF(self._surface_rect.left() + 2, tip_y - 6),
+                        QPointF(self._surface_rect.left() + 2, tip_y + 6),
+                    )
+                    self._tail_tip = QPointF(4, tip_y)
+            elif dy >= 0:
+                # 桌宠中心在气泡下方：尾巴从底边朝下伸向桌宠
+                self._surface_rect = local.adjusted(4, 3, -4, -10)
+                tip_x = min(max(anchor_center.x(), 20), local.width() - 20)
+                self._tail_base = (
+                    QPointF(tip_x - 6, self._surface_rect.bottom() - 2),
+                    QPointF(tip_x + 6, self._surface_rect.bottom() - 2),
+                )
+                self._tail_tip = QPointF(tip_x, local.bottom() - 4)
+            else:
+                # 桌宠中心在气泡上方：尾巴从顶边朝上伸向桌宠
+                self._surface_rect = local.adjusted(4, 10, -4, -4)
+                tip_x = min(max(anchor_center.x(), 20), local.width() - 20)
+                self._tail_base = (
+                    QPointF(tip_x - 6, self._surface_rect.top() + 2),
+                    QPointF(tip_x + 6, self._surface_rect.top() + 2),
+                )
+                self._tail_tip = QPointF(tip_x, 4)
+        radius = float(self._preset["radius"])
+        # F-PERF P2b：几何签名 = 全部绘制输入。跟随平移（锚点与窗口同步位移）
+        # 时相对几何逐位不变，跳过 QPainterPath 布尔运算（united/simplified）
+        # 与整窗重绘；几何真变（换边/夹取/尺寸/换图）照旧重建。
+        key = (
+            self._style_id,
+            local.x(), local.y(), local.width(), local.height(),
+            self._surface_rect.x(), self._surface_rect.y(),
+            self._surface_rect.width(), self._surface_rect.height(),
+            self._tail_base[0].x(), self._tail_base[0].y(),
+            self._tail_base[1].x(), self._tail_base[1].y(),
+            self._tail_tip.x(), self._tail_tip.y(),
+            radius,
+            self._image_paint_key(),
+        )
+        if key == self._surface_geometry_key:
+            return
+        rounded = QPainterPath()
+        rounded.addRoundedRect(QRectF(self._surface_rect), radius, radius)
+        self._main_bubble_path = QPainterPath(rounded)
+        self._breath_paths = []
+        tail = QPainterPath()
+        tail.moveTo(self._tail_base[0])
+        tail.lineTo(self._tail_tip)
+        tail.lineTo(self._tail_base[1])
+        tail.closeSubpath()
+        self._surface_path = rounded.united(tail).simplified()
+        self._surface_geometry_key = key
+        self.update()
+
+    def _build_breath_bubble_geometry(self, local: QRect) -> None:
+        """Build the reference's organic bubble plus two detached breath bubbles.
+
+        F-PERF P2b：几何只依赖 ``local`` 与配图内容（见 ``_image_paint_key``），
+        签名不变即整体逐位不变 → 直接跳过重建（5 段三次贝塞尔 + 两个副泡 +
+        配图裁剪路径）。重建过一次就置 ``_breath_geometry_pending``，由
+        ``_update_surface_geometry`` 消费成一次 ``update()``——本方法自身也被
+        ``_place`` 的"按可见轮廓定位"路径单独调用（那时不该提前上屏）。
+        """
+        key = (
+            self._style_id,
+            local.x(), local.y(), local.width(), local.height(),
+            self._image_paint_key(),
+        )
+        if key == self._breath_geometry_key:
+            return
+        self._breath_geometry_key = key
+        self._breath_geometry_pending = True
+        sx = max(0.01, local.width() / 240.0)
+        sy = max(0.01, local.height() / 195.0)
+        self._breath_scale = min(sx, sy)
+        main = breath_main_bubble_path(local.size())
+
+        # The two trailing bubbles intentionally use hand-drawn cubic contours,
+        # not QPainterPath.addEllipse(), matching the reference's irregular rims.
+        large_x, large_y, large_w, large_h = (
+            local.width() - 71.0 * sx, local.height() - 58.0 * sy,
+            31.0 * sx, 29.0 * sy,
+        )
+        large = QPainterPath()
+        large.moveTo(large_x + large_w * 0.45, large_y)
+        large.cubicTo(
+            large_x + large_w * 0.72, large_y - large_h * 0.05,
+            large_x + large_w * 1.02, large_y + large_h * 0.28,
+            large_x + large_w * 0.94, large_y + large_h * 0.58,
+        )
+        large.cubicTo(
+            large_x + large_w * 0.86, large_y + large_h * 0.91,
+            large_x + large_w * 0.38, large_y + large_h * 1.04,
+            large_x + large_w * 0.11, large_y + large_h * 0.78,
+        )
+        large.cubicTo(
+            large_x - large_w * 0.07, large_y + large_h * 0.55,
+            large_x + large_w * 0.12, large_y + large_h * 0.14,
+            large_x + large_w * 0.45, large_y,
+        )
+        large.closeSubpath()
+
+        small_x, small_y, small_w, small_h = (
+            local.width() - 39.0 * sx, local.height() - 37.0 * sy,
+            14.0 * sx, 13.0 * sy,
+        )
+        small = QPainterPath()
+        small.moveTo(small_x + small_w * 0.40, small_y)
+        small.cubicTo(
+            small_x + small_w * 0.75, small_y - small_h * 0.03,
+            small_x + small_w * 1.03, small_y + small_h * 0.31,
+            small_x + small_w * 0.92, small_y + small_h * 0.62,
+        )
+        small.cubicTo(
+            small_x + small_w * 0.78, small_y + small_h * 0.96,
+            small_x + small_w * 0.34, small_y + small_h * 1.04,
+            small_x + small_w * 0.08, small_y + small_h * 0.70,
+        )
+        small.cubicTo(
+            small_x - small_w * 0.05, small_y + small_h * 0.42,
+            small_x + small_w * 0.09, small_y + small_h * 0.10,
+            small_x + small_w * 0.40, small_y,
+        )
+        small.closeSubpath()
+        self._main_bubble_path = main
+        self._breath_paths = [large, small]
+        self._surface_path = QPainterPath(main)
+        self._surface_path.addPath(large)
+        self._surface_path.addPath(small)
+        self._surface_rect = main.boundingRect().toRect()
+        self._tail_base = (QPointF(), QPointF())
+        self._tail_tip = QPointF()
+        self._breath_image_rect = QRectF()
+        self._breath_image_clip_path = QPainterPath()
+        if self._content_kind == "image" and not self._source_pixmap.isNull():
+            bounds = main.boundingRect()
+            safe = bounds.adjusted(
+                bounds.width() * 0.12,
+                bounds.height() * 0.12,
+                -bounds.width() * 0.18,
+                -bounds.height() * 0.15,
+            )
+            target = self._source_pixmap.size()
+            target.scale(safe.size().toSize(), Qt.AspectRatioMode.KeepAspectRatio)
+            image_rect = QRectF(0, 0, target.width(), target.height())
+            image_rect.moveCenter(safe.center())
+            rounded = QPainterPath()
+            image_radius = max(7.0, 12.0 * self._breath_scale)
+            rounded.addRoundedRect(image_rect, image_radius, image_radius)
+            self._breath_image_rect = image_rect
+            self._breath_image_clip_path = rounded.intersected(main)
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        del event
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        background = QColor(self._preset["background"])
+        border = QColor(self._preset["border"])
+        if self._preset.get("shape") == "breath_bubble":
+            self._paint_breath_bubble(painter, background, border)
+            return
+        self._paint_soft_shadow(painter, self._surface_path)
+        painter.setBrush(background)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawPath(self._surface_path)
+        self._standard_image_rect = QRectF()
+        if self._content_kind == "image" and not self._source_pixmap.isNull():
+            image_rect = QRectF(self.label.geometry())
+            image_clip = QPainterPath()
+            radius = max(5.0, float(self._preset["radius"]) * 0.65)
+            image_clip.addRoundedRect(image_rect, radius, radius)
+            painter.save()
+            painter.setClipPath(image_clip.intersected(self._surface_path))
+            painter.drawPixmap(
+                image_rect,
+                self._source_pixmap,
+                QRectF(self._source_pixmap.rect()),
+            )
+            painter.restore()
+            self._standard_image_rect = image_rect
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(border, 1.0))
+        painter.drawPath(self._surface_path)
+
+    def _paint_soft_shadow(self, painter: QPainter, path: QPainterPath) -> None:
+        base = QColor(self._preset["shadow"])
+        for width, alpha, offset_y in self._shadow_layers:
+            color = QColor(base)
+            color.setAlpha(alpha)
+            shadow_path = QTransform.fromTranslate(0, offset_y).map(path)
+            painter.setBrush(color)
+            painter.setPen(QPen(
+                color, width, Qt.PenStyle.SolidLine,
+                Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin,
+            ))
+            painter.drawPath(shadow_path)
+
+    def _paint_breath_bubble(self, painter: QPainter, background: QColor, border: QColor) -> None:
+        self._paint_soft_shadow(painter, self._surface_path)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(background)
+        painter.drawPath(self._main_bubble_path)
+
+        bounds = self._main_bubble_path.boundingRect()
+        if (
+            self._content_kind == "image"
+            and not self._source_pixmap.isNull()
+            and not self._breath_image_clip_path.isEmpty()
+        ):
+            painter.save()
+            painter.setClipPath(self._breath_image_clip_path)
+            painter.drawPixmap(
+                self._breath_image_rect,
+                self._source_pixmap,
+                QRectF(self._source_pixmap.rect()),
+            )
+            painter.restore()
+
+        water = QPainterPath()
+        self._water_start_ratio = 0.48
+        water.moveTo(bounds.left() - 2, bounds.top() + bounds.height() * self._water_start_ratio)
+        water.cubicTo(
+            bounds.left() + bounds.width() * 0.13, bounds.top() + bounds.height() * 0.70,
+            bounds.left() + bounds.width() * 0.30, bounds.top() + bounds.height() * 0.88,
+            bounds.left() + bounds.width() * 0.52, bounds.top() + bounds.height() * 0.90,
+        )
+        water.cubicTo(
+            bounds.left() + bounds.width() * 0.72, bounds.top() + bounds.height() * 0.92,
+            bounds.left() + bounds.width() * 0.90, bounds.top() + bounds.height() * 0.82,
+            bounds.right() + 2, bounds.top() + bounds.height() * 0.69,
+        )
+        water.lineTo(bounds.right() + 4, bounds.bottom() + 4)
+        water.lineTo(bounds.left() - 4, bounds.bottom() + 4)
+        water.closeSubpath()
+        painter.save()
+        painter.setClipPath(self._main_bubble_path)
+        painter.fillPath(water, QColor(self._water_fill))
+        painter.restore()
+
+        outline_width = max(2.2, 3.2 * self._breath_scale)
+        outline = QPen(border, outline_width, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(outline)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawPath(self._main_bubble_path)
+        painter.setBrush(background)
+        for breath in self._breath_paths:
+            painter.drawPath(breath)
+
+        highlight = QPainterPath()
+        highlight_start = 0.70
+        highlight_end = 0.85
+        highlight.moveTo(bounds.left() + bounds.width() * highlight_start, bounds.top() + bounds.height() * 0.14)
+        highlight.cubicTo(
+            bounds.left() + bounds.width() * 0.76, bounds.top() + bounds.height() * 0.17,
+            bounds.left() + bounds.width() * 0.82, bounds.top() + bounds.height() * 0.23,
+            bounds.left() + bounds.width() * highlight_end, bounds.top() + bounds.height() * 0.27,
+        )
+        painter.setPen(QPen(border, max(2.0, 3.0 * self._breath_scale), Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        painter.drawPath(highlight)
+        glint = QPainterPath()
+        glint_start = 0.875
+        glint_end = 0.92
+        glint.moveTo(bounds.left() + bounds.width() * glint_start, bounds.top() + bounds.height() * 0.30)
+        glint.lineTo(bounds.left() + bounds.width() * glint_end, bounds.top() + bounds.height() * 0.35)
+        painter.drawPath(glint)
+        self._highlight_width_ratios = (
+            highlight_end - highlight_start,
+            glint_end - glint_start,
+        )

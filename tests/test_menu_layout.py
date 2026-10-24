@@ -1,0 +1,3247 @@
+from pet.menu_layout import (
+    load_default_menu_layout,
+    materialize_implicit_separators,
+    resolve_menu_layout,
+)
+
+
+def test_modern_default_v1_has_compact_root_and_safety_actions():
+    layout = load_default_menu_layout("modern-default-v1")
+
+    assert layout["schema_version"] == 1
+    assert layout["layout_id"] == "modern-default-v1"
+    assert [node["id"] for node in layout["nodes"]] == [
+        "ojingjing",
+        "default.separator-profile",
+        "chat",
+        "look_screen",
+        "screen_capture",
+        "default.separator-interaction",
+        "animations_hub",
+        "character",
+        "playback_speed",
+        "size",
+        "music",
+        "default.separator-playback",
+        "pet_controls",
+        "quick_launch",
+        "default.separator-pet",
+        "tools_help",
+        "agent_link",
+        "proactive_screen",
+        "todo_panel",
+        "quiet_mode",
+        "memory_trim",
+        "weather",
+        "weather_cities",
+        "voice_chime_now",
+        "voice_chime_toggle",
+        "festival_now",
+        "festival_toggle",
+        "divination_draw",
+        "default.separator-tools",
+        "modern_settings",
+        "quit",
+    ]
+    assert layout["nodes"][-2:] == [
+        {"type": "action", "id": "modern_settings", "visible": True, "section": "system"},
+        {"type": "action", "id": "quit", "visible": True, "section": "system"},
+    ]
+
+
+def test_legacy_section_boundaries_become_editable_separator_nodes():
+    upgraded = materialize_implicit_separators({
+        "schema_version": 1,
+        "layout_id": "user",
+        "nodes": [
+            {"type": "action", "id": "chat", "visible": True, "section": "one"},
+            {"type": "action", "id": "look_screen", "visible": True, "section": "two"},
+        ],
+    })
+
+    assert [node["type"] for node in upgraded["nodes"]] == [
+        "action", "separator", "action"
+    ]
+    assert upgraded["nodes"][1]["id"] == "user.separator-1"
+
+
+def test_invalid_layout_falls_back_to_minimum_safe_menu():
+    result = resolve_menu_layout(
+        {
+            "schema_version": 1,
+            "layout_id": "user",
+            "nodes": [
+                {"type": "action", "id": "quit", "visible": True},
+                {"type": "action", "id": "quit", "visible": True},
+            ],
+        },
+        registered_actions={"modern_settings", "quit"},
+        available_actions={"modern_settings", "quit"},
+    )
+
+    assert result.source == "fallback"
+    assert result.diagnostics == ("duplicate-action:quit",)
+    assert result.nodes == (
+        {"type": "action", "id": "modern_settings", "visible": True},
+        {"type": "action", "id": "quit", "visible": True},
+    )
+
+
+def test_user_layout_filters_hidden_unavailable_and_empty_submenus():
+    result = resolve_menu_layout(
+        {
+            "schema_version": 1,
+            "layout_id": "user",
+            "nodes": [
+                {"type": "action", "id": "chat", "visible": False},
+                {"type": "action", "id": "look_screen", "visible": True},
+                {
+                    "type": "submenu",
+                    "id": "pet_controls",
+                    "label": "桌宠控制",
+                    "visible": True,
+                    "children": [
+                        {"type": "action", "id": "no_move", "visible": True},
+                        {"type": "action", "id": "mouse_through", "visible": True},
+                    ],
+                },
+                {
+                    "type": "submenu",
+                    "id": "empty_tools",
+                    "label": "空工具",
+                    "visible": True,
+                    "children": [
+                        {"type": "action", "id": "balance", "visible": False}
+                    ],
+                },
+                {"type": "action", "id": "modern_settings", "visible": True},
+                {"type": "action", "id": "quit", "visible": True},
+            ],
+        },
+        registered_actions={
+            "chat",
+            "look_screen",
+            "no_move",
+            "mouse_through",
+            "balance",
+            "modern_settings",
+            "quit",
+        },
+        available_actions={"no_move", "modern_settings", "quit"},
+    )
+
+    assert result.source == "user"
+    assert result.diagnostics == ()
+    assert result.nodes == (
+        {
+            "type": "submenu",
+            "id": "pet_controls",
+            "label": "桌宠控制",
+            "visible": True,
+            "children": (
+                {"type": "action", "id": "no_move", "visible": True},
+            ),
+        },
+        {"type": "action", "id": "modern_settings", "visible": True},
+        {"type": "action", "id": "quit", "visible": True},
+    )
+
+
+def test_layout_preserves_alias_icon_and_explicit_separator_nodes():
+    result = resolve_menu_layout(
+        {
+            "schema_version": 1,
+            "layout_id": "user",
+            "nodes": [
+                {
+                    "type": "action",
+                    "id": "chat",
+                    "visible": True,
+                    "alias": "和鲸鱼聊聊",
+                    "icon": "screen",
+                },
+                {"type": "separator", "id": "user.separator-1", "visible": True},
+                {"type": "action", "id": "modern_settings", "visible": True},
+                {"type": "action", "id": "quit", "visible": True},
+            ],
+        },
+        registered_actions={"chat", "modern_settings", "quit"},
+        available_actions={"chat", "modern_settings", "quit"},
+    )
+
+    assert result.nodes[0] == {
+        "type": "action",
+        "id": "chat",
+        "visible": True,
+        "alias": "和鲸鱼聊聊",
+        "icon": "screen",
+    }
+    assert result.nodes[1] == {
+        "type": "separator",
+        "id": "user.separator-1",
+        "visible": True,
+    }
+
+
+def test_runtime_feature_state_does_not_filter_menu_layout_actions():
+    from pet.context_menus.registry import MENU_ACTIONS
+
+    class Config:
+        def get(self, key, default=None):
+            if key == "menu_easter_egg":
+                return {"enabled": False}
+            if key == "quick_launch_apps":
+                return []
+            return default
+
+    class Pet:
+        cfg = Config()
+        on_open_chat = lambda self: None
+        on_look_screen = lambda self: None
+        on_show_balance = lambda self, parent=None: None
+        on_check_update = lambda self, parent=None: None
+        on_open_modern_settings = lambda self: None
+        on_spawn_pet = lambda self: None
+
+    pet = Pet()
+    assert {"ojingjing", "quick_launch"} <= MENU_ACTIONS.available_ids(pet)
+    assert {"ojingjing", "quick_launch"}.isdisjoint(MENU_ACTIONS.enabled_ids(pet))
+
+
+def test_runtime_menu_renders_alias_icon_separator_and_disabled_item():
+    from PySide6.QtWidgets import QApplication, QMenu
+
+    from pet.context_menus.registry import MENU_ACTIONS
+
+    class Config:
+        def get(self, key, default=None):
+            return [] if key == "quick_launch_apps" else default
+
+    class Pet:
+        cfg = Config()
+        on_open_chat = lambda self: None
+        on_open_modern_settings = lambda self: None
+        request_quit = lambda self: None
+
+    app = QApplication.instance() or QApplication([])
+    menu = QMenu()
+    nodes = (
+        {"type": "action", "id": "chat", "alias": "和鲸鱼聊聊", "icon": "screen"},
+        {"type": "separator", "id": "user.separator-1"},
+        {"type": "action", "id": "quick_launch"},
+    )
+    MENU_ACTIONS.populate(menu, Pet(), nodes)
+
+    actions = menu.actions()
+    assert actions[0].text() == "和鲸鱼聊聊"
+    assert not actions[0].icon().isNull()
+    assert actions[1].isSeparator()
+    assert actions[2].text() == "快捷启动"
+    assert not actions[2].isEnabled()
+    assert actions[2].toolTip() == "尚未配置快捷启动应用"
+    assert actions[2].menu().actions()[0].text() == "尚未配置快捷项"
+    menu.close()
+    app.processEvents()
+
+
+def test_menu_editor_customizes_alias_icon_separator_and_shows_runtime_state():
+    from PySide6.QtWidgets import QApplication
+
+    from pet.context_menus.registry import MENU_ACTIONS
+    from pet.modern_settings_dialog import MenuLayoutEditor
+
+    app = QApplication.instance() or QApplication([])
+    editor = MenuLayoutEditor(
+        None,
+        available_actions=MENU_ACTIONS.ids,
+        enabled_actions=MENU_ACTIONS.ids - {"quick_launch"},
+    )
+
+    assert [editor.tree.headerItem().text(index) for index in range(3)] == [
+        "菜单项", "状态", "位置",
+    ]
+    quick_launch = editor.item_for_action("quick_launch")
+    assert quick_launch is not None
+    assert quick_launch.text(1) == "已停用"
+    assert quick_launch.flags() & __import__("PySide6").QtCore.Qt.ItemFlag.ItemIsEnabled
+
+    editor.set_item_alias("chat", "和鲸鱼聊聊")
+    editor.set_item_icon("chat", "screen")
+    editor.insert_separator(after_action_id="chat")
+
+    nodes = editor.value()["nodes"]
+    chat_index = next(index for index, node in enumerate(nodes) if node.get("id") == "chat")
+    assert nodes[chat_index]["alias"] == "和鲸鱼聊聊"
+    assert nodes[chat_index]["icon"] == "screen"
+    assert nodes[chat_index + 1]["type"] == "separator"
+    editor.close()
+    app.processEvents()
+
+
+def test_layout_restores_required_settings_and_exit_actions():
+    result = resolve_menu_layout(
+        {
+            "schema_version": 1,
+            "layout_id": "user",
+            "nodes": [
+                {"type": "action", "id": "chat", "visible": True},
+                {"type": "action", "id": "modern_settings", "visible": False},
+            ],
+        },
+        registered_actions={"chat", "modern_settings", "quit"},
+        available_actions={"chat", "modern_settings", "quit"},
+    )
+
+    assert result.source == "normalized"
+    assert result.diagnostics == (
+        "required-action-restored:modern_settings",
+        "required-action-restored:quit",
+    )
+    assert [node["id"] for node in result.nodes if node["type"] != "separator"] == [
+        "chat",
+        "modern_settings",
+        "quit",
+    ]
+
+
+def test_missing_user_layout_resolves_versioned_default():
+    registered = {
+        "ojingjing",
+        "chat",
+        "look_screen",
+        "screen_capture",
+        "animations_hub",
+        "character",
+        "playback_speed",
+        "size",
+        "drag_physics",
+        "no_move",
+        "mouse_through",
+        "on_top",
+        "autostart",
+        "return_corner",
+        "hide_pet",
+        "spawn_pet",
+        "clear_spawned_pets",
+        "agent_cost",
+        "music",
+        "music_pause",
+        "music_next",
+        "music_prev",
+        "music_quit",
+        "music_lyric_align",
+        "music_open_netease",
+        "music_open_qqmusic",
+        "music_open_kugou",
+        "music_open_soda",
+        "golden_spin",
+        "edge_probe",
+        "quick_launch",
+        "balance",
+        "harness",
+        "deepseek_web",
+        "check_update",
+        "network_info",
+        "github_project",
+        "quark_download",
+        "agent_link",
+        "proactive_screen",
+        "todo_panel",
+        "quiet_mode",
+        "memory_trim",
+        "weather",
+        "weather_cities",
+        "voice_chime_now",
+        "voice_chime_toggle",
+        "festival_now",
+        "festival_toggle",
+        "divination_draw",
+        "modern_settings",
+        "quit",
+    }
+
+    result = resolve_menu_layout(
+        None,
+        registered_actions=registered,
+        available_actions=registered,
+    )
+
+    assert result.source == "default"
+    assert result.diagnostics == ()
+    assert [node["id"] for node in result.nodes if node["type"] != "separator"] == [
+        "ojingjing",
+        "chat",
+        "look_screen",
+        "screen_capture",
+        "animations_hub",
+        "character",
+        "playback_speed",
+        "size",
+        "music",
+        "pet_controls",
+        "quick_launch",
+        "tools_help",
+        "agent_link",
+        "proactive_screen",
+        "todo_panel",
+        "quiet_mode",
+        "memory_trim",
+        "weather",
+        "weather_cities",
+        "divination_draw",
+        "modern_settings",
+        "quit",
+    ]
+    # 报时/节日四项在默认模板里 visible: false（2026-09-19 起默认不上菜单，
+    # 用户可在菜单编辑器自行加回），resolve 后被过滤，不出现在渲染结果里。
+    assert all(
+        item not in {node.get("id") for node in result.nodes}
+        for item in ("voice_chime_now", "voice_chime_toggle", "festival_now", "festival_toggle")
+    )
+
+
+def test_config_persists_menu_layout_override_without_copying_default(tmp_path):
+    from pet.config import Config
+
+    config = Config(tmp_path)
+    assert config.get("context_menu_layout") is None
+
+    override = {
+        "schema_version": 1,
+        "layout_id": "user",
+        "nodes": [
+            {"type": "action", "id": "modern_settings", "visible": True},
+            {"type": "action", "id": "quit", "visible": True},
+        ],
+    }
+    config.set("context_menu_layout", override)
+    config.save()
+
+    restored = Config(tmp_path)
+    assert restored.get("context_menu_layout") == override
+
+
+def test_saved_layout_drops_removed_mouse_through_action(tmp_path):
+    """2026-09-23：右键菜单去掉「鼠标穿透」，旧布局里的残留节点载入时就地清掉。
+
+    渲染层本来就会丢弃未注册 id（只影响当次显示），但菜单编辑器没有「删除菜单项」
+    操作，会把残留节点按「此平台不可用」一直回存下去；入口收敛必须在配置层收口，
+    否则旧布局里会永久留着一条幽灵菜单项。
+    """
+    from pet.config import Config
+
+    config = Config(tmp_path)
+    config.set("context_menu_layout", {
+        "schema_version": 1,
+        "layout_id": "user",
+        "nodes": [
+            {"type": "action", "id": "modern_settings", "visible": True},
+            {
+                "type": "submenu", "id": "pet_controls", "label": "桌宠控制", "visible": True,
+                "children": [
+                    {"type": "action", "id": "no_move", "visible": True},
+                    {"type": "action", "id": "mouse_through", "visible": True},
+                ],
+            },
+            {"type": "action", "id": "quit", "visible": True},
+        ],
+    })
+    config.save()
+
+    nodes = Config(tmp_path).get("context_menu_layout")["nodes"]
+    assert [node["id"] for node in nodes] == ["modern_settings", "pet_controls", "quit"]
+    assert [child["id"] for child in nodes[1]["children"]] == ["no_move"]
+
+
+def test_menu_registry_no_longer_registers_mouse_through():
+    """入口收敛：右键菜单注册表里不再有「鼠标穿透」，开关只留在设置页与托盘菜单。"""
+    from pet.context_menus.registry import MENU_ACTIONS, ACTION_ICONS, ACTION_LABELS
+
+    assert "mouse_through" not in MENU_ACTIONS.ids
+    assert "mouse_through" not in ACTION_LABELS
+    assert "mouse_through" not in ACTION_ICONS
+
+
+def test_unknown_schema_uses_safe_fallback_with_migration_diagnostic():
+    result = resolve_menu_layout(
+        {
+            "schema_version": 99,
+            "layout_id": "future",
+            "nodes": [{"type": "action", "id": "chat", "visible": True}],
+        },
+        registered_actions={"chat", "modern_settings", "quit"},
+        available_actions={"chat", "modern_settings", "quit"},
+    )
+
+    assert result.source == "fallback"
+    assert result.diagnostics == ("unsupported-schema:99",)
+    assert [node["id"] for node in result.nodes] == ["modern_settings", "quit"]
+
+
+def test_default_layout_populates_real_qmenu_hierarchy(monkeypatch):
+    import sys
+    from PySide6.QtGui import QPixmap
+    from PySide6.QtWidgets import QApplication, QMenu
+
+    from pet import catalog
+    from pet.context_menu import populate_context_menu
+    from pet.context_menus import shared
+
+    class FakeConfig:
+        values = {
+            "context_menu_layout": None,
+            "context_menu_appearance": {"theme": "light"},
+            "character": "shenshen",
+            "on_top": True,
+            "agent_link": {},
+            "music_lyric_enabled": True,
+        }
+
+        def get(self, key, default=None):
+            return self.values.get(key, default)
+
+        def set(self, key, value):
+            self.values[key] = value
+
+        def save(self):
+            return None
+
+    class FakePet:
+        cfg = FakeConfig()
+        on_open_chat = lambda self: None
+        on_look_screen = lambda self: None
+        on_show_balance = lambda self, parent=None: None
+        on_check_update = lambda self, parent=None: None
+        on_open_modern_settings = lambda self: None
+        on_spawn_pet = lambda self: None
+        idles = ["待机"]
+        turns = moves = clicks = acts = []
+        playback_speed = scale = 1.0
+        drag_physics = no_move = mouse_through = False
+
+        def icon_pixmap(self, size=64):
+            pixmap = QPixmap(size, size)
+            pixmap.fill()
+            return pixmap
+
+        def __getattr__(self, _name):
+            return lambda *args, **kwargs: None
+
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(shared.autostart_mod, "is_enabled", lambda: False)
+    monkeypatch.setattr(catalog, "list_available_characters", lambda: ["shenshen"])
+    menu = QMenu()
+
+    populate_context_menu(menu, FakePet())
+
+    root = [action.text() for action in menu.actions() if not action.isSeparator()]
+    expected_root = [
+        "厉害了我的鲸",
+        "AI 对话",
+        "看看屏幕",
+        "截图提问",
+        "播放动画",
+        "切换角色",
+        "播放速率",
+        "大小",
+        "音乐",
+        "桌宠控制",
+        "快捷启动",
+        "工具与帮助",
+        "Agent 联动",
+        "桌宠设置",
+        "退出",
+    ]
+    if sys.platform == "win32":
+        expected_root.insert(-2, "主动识屏")
+        expected_root.insert(-2, "待办提醒")
+        expected_root.insert(-2, "免打扰")
+        expected_root.insert(-2, "回收内存")
+    else:
+        expected_root.insert(-2, "待办提醒")
+        expected_root.insert(-2, "免打扰")
+    # 天气两个入口在 tools 段末尾（待办提醒之后、桌宠设置之前）；
+    # 「抽支签」紧随其后（2026-10-15 新功能，tools 段最后一个，默认可见）
+    expected_root[-2:-2] = ["查看天气", "天气城市", "抽支签"]
+    # 报时/节日四项默认不在菜单上（模板 visible: false，2026-09-19 起）
+    assert root == expected_root
+    rendered = ["|" if action.isSeparator() else action.text() for action in menu.actions()]
+    expected_rendered = [
+        "厉害了我的鲸", "|",
+        "AI 对话", "看看屏幕", "截图提问", "|",
+        "播放动画", "切换角色", "播放速率", "大小", "音乐", "|",
+        "桌宠控制", "快捷启动", "|",
+        "工具与帮助", "Agent 联动", "|",
+        "桌宠设置", "退出",
+    ]
+    if sys.platform == "win32":
+        expected_rendered.insert(-3, "主动识屏")
+    # tools 段顺序：… Agent 联动 [主动识屏] 待办提醒 免打扰 [回收内存] 查看天气 天气城市 抽支签 | 桌宠设置 退出
+    # （报时/节日四项默认 visible: false，不渲染；回收内存仅在 Windows 出现）
+    expected_rendered.insert(-3, "待办提醒")
+    expected_rendered.insert(-3, "免打扰")
+    if sys.platform == "win32":
+        expected_rendered.insert(-3, "回收内存")
+    expected_rendered[-3:-3] = ["查看天气", "天气城市", "抽支签"]
+    assert rendered == expected_rendered
+    pet_controls = next(action.menu() for action in menu.actions() if action.text() == "桌宠控制")
+    assert [action.text() for action in pet_controls.actions() if not action.isSeparator()] == [
+        "拖动物理",
+        "不移动",
+        "窗口置顶",
+        "开机自启",
+        "回到右下角",
+        "隐藏桌宠",
+        "生小肥鱼",
+        "关闭此鱼",
+        "显示本轮消费",
+        "黄金回旋",
+        "边缘探头",
+    ]
+    tools = next(action.menu() for action in menu.actions() if action.text() == "工具与帮助")
+    expected_tools = [
+        "DeepSeek 余额",
+        "DeepSeek Harness",
+        "打开网页版 DeepSeek",
+        "检查更新",
+        "网络信息",
+        "GitHub 项目页",
+    ]
+    if sys.platform == "win32":
+        expected_tools.append("夸克网盘下载")
+    assert [action.text() for action in tools.actions() if not action.isSeparator()] == expected_tools
+    # Harness 现在是子菜单（挂在既有 harness id 上，用户老布局无需迁移）：
+    # 启动（双目标：dsh web 界面 / 桌面端界面）+ 重启 / 停止必须齐全——
+    # 「停止」是用户关掉静默常驻服务的唯一入口。
+    harness_action = next(
+        action for action in tools.actions() if action.text() == "DeepSeek Harness"
+    )
+    harness_menu = harness_action.menu()
+    assert harness_menu is not None
+    assert [action.text() for action in harness_menu.actions()] == [
+        "启动 dsh web 界面",
+        "启动桌面端界面",
+        "重启服务",
+        "停止服务",
+    ]
+    # 音乐子菜单里的「歌词对齐」：实测网易云音乐完全不上报播放进度，快进 / 中途
+    # 开始播放后只能手动对准，五个手柄必须齐全（同样挂在单一 id 上，老布局免迁移）。
+    music_action = next(action for action in menu.actions() if action.text() == "音乐")
+    music_menu = music_action.menu()
+    assert music_menu is not None
+    align_action = next(
+        action for action in music_menu.actions() if action.text() == "歌词对齐"
+    )
+    align_menu = align_action.menu()
+    assert align_menu is not None
+    assert [action.text() for action in align_menu.actions()] == [
+        "回到开头（现在这句算开头）",
+        "上一句",
+        "下一句",
+        "后退 5 秒",
+        "前进 5 秒",
+    ]
+    menu.close()
+    app.processEvents()
+
+
+def test_settings_menu_editor_commits_visibility_draft(tmp_path, monkeypatch):
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication
+
+    from pet import modern_settings_dialog as settings_mod
+    from pet.config import Config
+    from pet.context_menus.registry import MENU_ACTIONS
+    from pet.modern_settings_dialog import ModernSettingsDialog
+
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(settings_mod.autostart_mod, "is_enabled", lambda: False)
+    config = Config(tmp_path)
+    dialog = ModernSettingsDialog(config, include_ai=False)
+
+    sidebar_labels = [dialog.sidebar.item(i).text() for i in range(dialog.sidebar.count())]
+    assert "菜单" in sidebar_labels
+    # 不可用动作（no-chat 构建里的 chat）不再进编辑器树——真实菜单里它
+    # 本来就不出场，编辑器里留灰项只会误导（2026-10-24 口径）。
+    assert dialog.menu_layout_editor.item_for_action("chat") is None
+    # 可见性草稿验证改用**可用**动作（weather 在默认模板里可见）。
+    weather_item = dialog.menu_layout_editor.item_for_action("weather")
+    assert weather_item is not None
+    weather_item.setCheckState(0, Qt.CheckState.Unchecked)
+    assert Config(tmp_path).get("context_menu_layout") is None
+    dialog.save_exit_button.click()
+
+    restored = Config(tmp_path)
+    saved = restored.get("context_menu_layout")
+    # 草稿树里没有 chat（不可用不进树），保存的覆盖里自然也没有
+    assert saved is not None
+    assert "chat" not in [n["id"] for n in saved.get("nodes", []) if n.get("type") == "action"]
+    # 解析口径与真实菜单一致：按可用集（chat 本就不可用），weather 是用户显式隐藏
+    result = resolve_menu_layout(
+        saved,
+        registered_actions=MENU_ACTIONS.ids,
+        available_actions=dialog.menu_layout_editor.available_actions,
+    )
+    assert "weather" not in [node["id"] for node in result.nodes]
+    assert "chat" not in [node["id"] for node in result.nodes]
+    app.processEvents()
+
+
+def test_settings_menu_editor_moves_action_into_submenu_without_dragging(tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QApplication
+
+    from pet import modern_settings_dialog as settings_mod
+    from pet.config import Config
+    from pet.modern_settings_dialog import ModernSettingsDialog
+
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(settings_mod.autostart_mod, "is_enabled", lambda: False)
+    dialog = ModernSettingsDialog(Config(tmp_path), include_ai=False)
+    editor = dialog.menu_layout_editor
+    editor.tree.setCurrentItem(editor.item_for_action("playback_speed"))
+    editor.move_menu.aboutToShow.emit()
+    next(action for action in editor.move_menu.actions() if action.data() == "pet_controls").trigger()
+    dialog.save_exit_button.click()
+
+    nodes = Config(tmp_path).get("context_menu_layout")["nodes"]
+    pet_controls = next(node for node in nodes if node["id"] == "pet_controls")
+    assert [child["id"] for child in pet_controls["children"]][-1] == "playback_speed"
+    app.processEvents()
+
+
+def test_menu_editor_reorders_and_promotes_actions_with_button_controls():
+    from PySide6.QtWidgets import QApplication
+
+    from pet.modern_settings_dialog import MenuLayoutEditor
+
+    app = QApplication.instance() or QApplication([])
+    editor = MenuLayoutEditor(None)
+    root_ids = [node["id"] for node in editor.value()["nodes"]]
+    editor.tree.setCurrentItem(editor.item_for_action("chat"))
+    editor.move_down_action.trigger()
+    reordered_ids = [node["id"] for node in editor.value()["nodes"]]
+    chat_index = root_ids.index("chat")
+    assert reordered_ids[chat_index : chat_index + 2] == ["look_screen", "chat"]
+
+    promoted = editor.item_for_action("drag_physics")
+    editor.tree.setCurrentItem(promoted)
+    editor.move_menu.aboutToShow.emit()
+    next(action for action in editor.move_menu.actions() if action.data() == "__root__").trigger()
+
+    assert promoted.parent() is None
+    assert editor.value()["nodes"][-1]["id"] == "drag_physics"
+    assert editor.preview.topLevelItem(editor.preview.topLevelItemCount() - 1).text(0) == "拖动物理"
+    editor.close()
+    app.processEvents()
+
+
+def test_menu_editor_reset_restores_the_versioned_default():
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication
+
+    from pet.modern_settings_dialog import MenuLayoutEditor
+
+    app = QApplication.instance() or QApplication([])
+    editor = MenuLayoutEditor(None)
+    editor.item_for_action("chat").setCheckState(0, Qt.CheckState.Unchecked)
+    editor.tree.setCurrentItem(editor.item_for_action("drag_physics"))
+    editor.move_menu.aboutToShow.emit()
+    next(action for action in editor.move_menu.actions() if action.data() == "__root__").trigger()
+
+    editor.reset_action.trigger()
+
+    assert editor.value()["nodes"] == load_default_menu_layout()["nodes"]
+    editor.close()
+    app.processEvents()
+
+
+def test_settings_menu_editor_creates_named_submenu(tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QApplication, QInputDialog
+
+    from pet import modern_settings_dialog as settings_mod
+    from pet.config import Config
+    from pet.modern_settings_dialog import ModernSettingsDialog
+
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(settings_mod.autostart_mod, "is_enabled", lambda: False)
+    monkeypatch.setattr(QInputDialog, "getText", lambda *args, **kwargs: ("常用操作", True))
+    dialog = ModernSettingsDialog(Config(tmp_path), include_ai=False)
+
+    dialog.menu_layout_editor.new_submenu_action.trigger()
+
+    user_submenus = [
+        node for node in dialog.menu_layout_editor.value()["nodes"]
+        if node["type"] == "submenu" and node["id"].startswith("user.")
+    ]
+    assert [(node["label"], node["children"]) for node in user_submenus] == [
+        ("常用操作", [])
+    ]
+    dialog.reject()
+    app.processEvents()
+
+
+def test_menu_editor_confirms_before_deleting_submenu_and_preserves_children(monkeypatch):
+    from PySide6.QtWidgets import QApplication, QMessageBox
+
+    from pet.menu_layout import load_default_menu_layout
+    from pet.modern_settings_dialog import MenuLayoutEditor
+
+    app = QApplication.instance() or QApplication([])
+    layout = load_default_menu_layout()
+    chat = next(node for node in layout["nodes"] if node["id"] == "chat")
+    layout["nodes"].remove(chat)
+    layout["nodes"].insert(1, {
+        "type": "submenu", "id": "user.work", "label": "工作",
+        "visible": True, "children": [chat],
+    })
+    editor = MenuLayoutEditor(layout)
+    submenu = editor.tree.topLevelItem(1)
+    editor.tree.setCurrentItem(submenu)
+
+    monkeypatch.setattr(
+        QMessageBox, "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Cancel,
+    )
+    editor.delete_submenu_action.trigger()
+    assert any(node["id"] == "user.work" for node in editor.value()["nodes"])
+
+    monkeypatch.setattr(
+        QMessageBox, "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Yes,
+    )
+    editor.delete_submenu_action.trigger()
+    nodes = editor.value()["nodes"]
+    assert all(node["id"] != "user.work" for node in nodes)
+    assert nodes[1]["id"] == "chat"
+    editor.close()
+    app.processEvents()
+
+
+def test_menu_editor_removes_submenu_after_its_last_item_moves_out():
+    from PySide6.QtWidgets import QApplication
+
+    from pet.menu_layout import load_default_menu_layout
+    from pet.modern_settings_dialog import MenuLayoutEditor
+
+    app = QApplication.instance() or QApplication([])
+    layout = load_default_menu_layout()
+    chat = next(node for node in layout["nodes"] if node["id"] == "chat")
+    layout["nodes"].remove(chat)
+    layout["nodes"].insert(1, {
+        "type": "submenu", "id": "user.work", "label": "工作",
+        "visible": True, "children": [chat],
+    })
+    editor = MenuLayoutEditor(layout)
+    editor.tree.setCurrentItem(editor.item_for_action("chat"))
+    editor.move_menu.aboutToShow.emit()
+    root_action = next(
+        action for action in editor.move_menu.actions()
+        if action.text() == "根菜单"
+    )
+    root_action.trigger()
+
+    nodes = editor.value()["nodes"]
+    assert all(node["id"] != "user.work" for node in nodes)
+    assert any(node["id"] == "chat" for node in nodes)
+    editor.close()
+    app.processEvents()
+
+
+def test_menu_editor_drag_model_cleanup_removes_the_emptied_source_submenu():
+    from PySide6.QtWidgets import QApplication
+
+    from pet.menu_layout import load_default_menu_layout
+    from pet.modern_settings_dialog import MenuLayoutEditor
+
+    app = QApplication.instance() or QApplication([])
+    layout = load_default_menu_layout()
+    chat = next(node for node in layout["nodes"] if node["id"] == "chat")
+    layout["nodes"].remove(chat)
+    layout["nodes"].insert(1, {
+        "type": "submenu", "id": "user.drag", "label": "拖拽来源",
+        "visible": True, "children": [chat],
+    })
+    editor = MenuLayoutEditor(layout)
+    submenu = editor.tree.topLevelItem(1)
+    moved = submenu.takeChild(0)
+    editor.tree.addTopLevelItem(moved)
+    app.processEvents()
+
+    assert all(node["id"] != "user.drag" for node in editor.value()["nodes"])
+    assert any(node["id"] == "chat" for node in editor.value()["nodes"])
+    editor.close()
+    app.processEvents()
+
+
+def test_user_layout_rejects_nested_submenus_beyond_one_level():
+    result = resolve_menu_layout(
+        {
+            "schema_version": 1,
+            "layout_id": "user",
+            "nodes": [{
+                "type": "submenu",
+                "id": "user.outer",
+                "label": "外层",
+                "visible": True,
+                "children": [{
+                    "type": "submenu",
+                    "id": "user.inner",
+                    "label": "内层",
+                    "visible": True,
+                    "children": [
+                        {"type": "action", "id": "chat", "visible": True}
+                    ],
+                }],
+            }],
+        },
+        registered_actions={"chat", "modern_settings", "quit"},
+        available_actions={"chat", "modern_settings", "quit"},
+    )
+
+    assert result.source == "fallback"
+    assert result.diagnostics == ("submenu-depth-exceeded:user.inner",)
+    assert [node["id"] for node in result.nodes] == ["modern_settings", "quit"]
+
+
+def test_settings_sidebar_uses_stable_domains_and_owns_representative_rows(tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QApplication
+
+    from pet import modern_settings_dialog as settings_mod
+    from pet.config import Config
+    from pet.modern_settings_dialog import ModernSettingsDialog, SettingRow
+
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(settings_mod.autostart_mod, "is_enabled", lambda: False)
+    dialog = ModernSettingsDialog(Config(tmp_path), include_ai=True)
+    # 2026-09-19 新增「文件识别」域（拖文件解读，settings_file_interpret）。
+    expected = ["常规", "桌宠", "互动", "菜单", "桌面组件", "功能", "AI 与对话", "自动化与联动", "语音", "文件识别", "更新"]
+    assert [dialog.sidebar.item(i).text() for i in range(dialog.sidebar.count())] == expected
+
+    def owner(setting_id):
+        row = dialog.findChild(SettingRow, f"settingRow_{setting_id}")
+        return next(expected[index] for index in range(dialog.pages.count()) if dialog.pages.widget(index).isAncestorOf(row))
+
+    assert owner("mouse_through") == "互动"
+    # 台词自动预缓存必须留在「互动」域的「点击反馈」组：它的 setting_id 用 click_
+    # 前缀才会被 claim_prefix("click_") 认领，否则掉进「待分类（开发期）」——这正是
+    # 本功能第一版踩过的坑（全量测试因此红了一条）。
+    assert owner("click_self_talk_precache") == "互动"
+    # 配图概率属于「自言自语」组（必须是显式 claim 的成员，否则掉进「待分类」）。
+    assert owner("self_talk_image_chance") == "互动"
+    assert owner("menu_theme") == "菜单"
+    assert owner("quick_launch_apps") == "菜单"
+    assert owner("dynamic_island_enabled") == "桌面组件"
+    assert owner("api_url") == "AI 与对话"
+    assert owner("voice_chime_enabled") == "语音"
+    assert owner("file_interpret_enabled") == "文件识别"
+    assert owner("music_player_netease") == "桌宠"
+    assert owner("music_player_qqmusic") == "桌宠"
+    assert "待分类（开发期）" not in [
+        label.text() for label in dialog.findChildren(settings_mod.QLabel)
+    ]
+    dialog.reject()
+    app.processEvents()
+
+
+def test_voice_chime_rows_live_only_in_their_own_sidebar_domain(tmp_path, monkeypatch):
+    """「语音报时」自 2026-09-17 起收在「语音」总域：voice_chime_* 行只落在该域，
+    automation 页不再持有。
+
+    历史事故：设置页里没包进 SettingRow 的控件不会被域收集机制搬运，页面移出
+    pages 后直接消失——这里把「立即试听」按钮所在行也一起断言。
+    """
+    from PySide6.QtWidgets import QApplication
+
+    from pet import modern_settings_dialog as settings_mod
+    from pet.config import Config
+    from pet.modern_settings_dialog import ModernSettingsDialog, SettingRow
+
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(settings_mod.autostart_mod, "is_enabled", lambda: False)
+    dialog = ModernSettingsDialog(Config(tmp_path), include_ai=True)
+    try:
+        labels = [dialog.sidebar.item(i).text() for i in range(dialog.sidebar.count())]
+        assert "语音" in labels
+        chime_page = dialog.pages.widget(labels.index("语音"))
+        automation_page = dialog.pages.widget(labels.index("自动化与联动"))
+
+        rows = [
+            row for row in dialog.findChildren(SettingRow)
+            if row.objectName().startswith("settingRow_voice_chime_")
+        ]
+        assert rows, "语音报时设置行必须存在"
+        for row in rows:
+            assert chime_page.isAncestorOf(row), f"{row.objectName()} 不在「语音」域"
+            assert not automation_page.isAncestorOf(row), (
+                f"{row.objectName()} 仍残留在「自动化与联动」域"
+            )
+
+        preview_row = dialog.findChild(SettingRow, "settingRow_voice_chime_preview")
+        assert preview_row is not None, "「立即试听」必须在 SettingRow 内才不会被域收集漏掉"
+        assert chime_page.isAncestorOf(preview_row)
+        assert chime_page.isAncestorOf(dialog.voice_chime_page.preview_btn)
+        assert dialog.voice_chime_page.preview_btn.isVisibleTo(chime_page), (
+            "试听按钮在新域里必须可见（历史事故：打包版不可见）"
+        )
+        previews: list[str] = []
+        dialog.voice_chime_page.preview_requested.connect(previews.append)
+        dialog.voice_chime_page.preview_btn.click()
+        assert previews == [""], "搬家后「立即试听」仍须照常发信号（功能不变）"
+    finally:
+        dialog.reject()
+        app.processEvents()
+
+
+def test_voice_chime_search_jumps_to_its_own_sidebar_domain(tmp_path, monkeypatch):
+    """搜索命中语音报时行时，侧边栏应跳到「语音」总域。"""
+    from PySide6.QtWidgets import QApplication
+
+    from pet import modern_settings_dialog as settings_mod
+    from pet.config import Config
+    from pet.modern_settings_dialog import ModernSettingsDialog
+
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(settings_mod.autostart_mod, "is_enabled", lambda: False)
+    dialog = ModernSettingsDialog(Config(tmp_path), include_ai=True)
+    try:
+        dialog.search_edit.setText("报时频率")
+        app.processEvents()
+        assert dialog.sidebar.currentItem().text() == "语音"
+        assert dialog.search_status.text() == "1/1 · 报时频率"
+    finally:
+        dialog.reject()
+        app.processEvents()
+
+
+def _section_of(dialog, settings_mod, setting_id):
+    """返回某个设置行所属的 SettingsSection（域重构后行会被 reparent 进共享卡片）。"""
+    from pet.modern_settings_dialog import SettingRow
+
+    row = dialog.findChild(SettingRow, f"settingRow_{setting_id}")
+    assert row is not None, f"{setting_id} 行必须存在"
+    parent = row.parentWidget()
+    while parent is not None and not isinstance(parent, settings_mod.SettingsSection):
+        parent = parent.parentWidget()
+    assert parent is not None, f"{setting_id} 必须落在某个 SettingsSection 内"
+    return parent
+
+
+def _section_title(section) -> str:
+    if section.toggle is not None:  # 高级组（默认收起）标题在 disclosure 按钮上
+        return section.toggle.text()
+    from pet import modern_settings_dialog as settings_mod
+
+    label = section.findChild(settings_mod.QLabel, "sectionTitle")
+    assert label is not None
+    return label.text()
+
+
+def test_voice_domain_owns_only_tts_rows(tmp_path, monkeypatch):
+    """「语音」域按 2026-09-17 定稿口径只收鱼开口说话（TTS）类设置：
+    语音报时组 + 节日提醒组（节日提醒原在「自动化与联动」域，但带 speak/TTS 播报）。
+
+    音效类不属此域：点击音效回「互动 · 点击反馈」、碰撞音效回「桌宠」碰撞组
+    （见下面两个用例），Agent 提示音效仍留在 Agent 联动折叠框。
+    """
+    from PySide6.QtWidgets import QApplication
+
+    from pet import modern_settings_dialog as settings_mod
+    from pet.config import Config
+    from pet.modern_settings_dialog import ModernSettingsDialog, SettingRow
+
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(settings_mod.autostart_mod, "is_enabled", lambda: False)
+    dialog = ModernSettingsDialog(Config(tmp_path), include_ai=True)
+    try:
+        labels = [dialog.sidebar.item(i).text() for i in range(dialog.sidebar.count())]
+        voice_page = dialog.pages.widget(labels.index("语音"))
+        automation_page = dialog.pages.widget(labels.index("自动化与联动"))
+
+        all_rows = dialog.findChildren(SettingRow)
+        chime_rows = [r for r in all_rows if r.objectName().startswith("settingRow_voice_chime_")]
+        festival_rows = [r for r in all_rows if r.objectName().startswith("settingRow_festival")]
+        # 语音报时与节日提醒的行**整组都在**：锁「一个不漏、也不留在自动化与联动」。
+        # 行数不再写死（2026-10-14 provider 化后语音报时多了引擎与四家后端的字段行），
+        # 改为与两页自己卡片里的行数对齐——本用例要钉的是「归属」，不是「行数」。
+        from pet.settings_widgets import SettingsSection  # noqa: PLC0415
+
+        def _card(title: str):
+            """标题为 ``title`` 的那张卡（找不到返回 None，交给断言报出来）。"""
+            for section in dialog.findChildren(SettingsSection):
+                label = section.findChild(settings_mod.QLabel, "sectionTitle")
+                if label is not None and label.text() == title:
+                    return section
+            return None
+
+        # 语音报时那张卡里的每一行都要在「语音」域：卡里除 `voice_chime_*` 行外还有
+        # 折叠头与凭据组行（`tts_backend_fold_*` / `tts_credentials`），所以这里比的是
+        # 「卡里没有一行掉队」而不是行数相等。本用例要钉的是**归属**，不是行数。
+        card = _card("语音报时")
+        assert card is not None, "「语音」域必须有「语音报时」这张卡"
+        for row in card.rows:
+            assert voice_page.isAncestorOf(row), f"{row.objectName()} 必须在「语音」域"
+        assert len(chime_rows) >= 12, "语音报时既有 12 行一个都不能少"
+        # 节日提醒整组（含 provider 化前后就有的 12 行 + 生日/动画/折叠头等新增行）
+        # 同样一行不留地进「语音」域；具体分卡见 test_festival_settings_layout。
+        for row in festival_rows:
+            assert voice_page.isAncestorOf(row), f"{row.objectName()} 必须在「语音」域"
+        for item in chime_rows + festival_rows:
+            assert voice_page.isAncestorOf(item), f"{item.objectName()} 必须在「语音」域"
+            assert not automation_page.isAncestorOf(item), (
+                f"{item.objectName()} 仍残留在「自动化与联动」域"
+            )
+
+        section_titles = [
+            label.text()
+            for label in voice_page.findChildren(settings_mod.QLabel, "sectionTitle")
+        ]
+        # 2026-10-14 起两页各自**自建卡片**交给本域：语音报时整组占一张「语音报时」
+        # （页内再分基础设置/合成后端/语音/台词歌词，见 test_voice_chime_settings_layout），
+        # 节日提醒整组由 festival_settings.build_domain_page 现造卡片收走
+        # （何时提醒/提醒哪些日子/怎么提醒/你的生日/少用项）。本域不再按「一组行」
+        # 拼小分组——那样页面容器会散架、分组标题会丢。
+        assert section_titles == [
+            "语音报时",
+            "何时提醒",
+            "提醒哪些日子",
+            "怎么提醒",
+            "你的生日",
+            "少用项",
+        ]
+
+        # 音效类三组都不在「语音」域（各自回原功能分组，行本身仍照常存在）。
+        for setting_id in (
+            "click_sound",
+            "click_sound_pack",
+            "click_sound_volume",
+            "click_sound_preview",
+            "collision_sound_enabled",
+            "collision_sound_volume",
+        ):
+            voice_row = dialog.findChild(SettingRow, f"settingRow_{setting_id}")
+            assert voice_row is not None, f"{setting_id} 行必须存在"
+            assert not voice_page.isAncestorOf(voice_row), (
+                f"{setting_id} 是音效类，不该落在「语音」域"
+            )
+        assert "待分类（开发期）" not in [
+            label.text() for label in dialog.findChildren(settings_mod.QLabel)
+        ]
+    finally:
+        dialog.reject()
+        app.processEvents()
+
+
+def test_click_sound_rows_return_to_interaction_click_feedback(tmp_path, monkeypatch):
+    """点击音效 4 行回「互动 · 点击反馈」，且保持原有行顺序（在 click_self_talk 之前）。
+
+    整组走 click_ 前缀认领（与 HEAD 一致，本批未动认领规则本身）；域归属必须
+    唯一——不能同时被「语音」域或「待分类（开发期）」收走。
+    """
+    from PySide6.QtWidgets import QApplication
+
+    from pet import modern_settings_dialog as settings_mod
+    from pet.config import Config
+    from pet.modern_settings_dialog import ModernSettingsDialog
+
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(settings_mod.autostart_mod, "is_enabled", lambda: False)
+    dialog = ModernSettingsDialog(Config(tmp_path), include_ai=True)
+    try:
+        labels = [dialog.sidebar.item(i).text() for i in range(dialog.sidebar.count())]
+        interaction_page = dialog.pages.widget(labels.index("互动"))
+        voice_page = dialog.pages.widget(labels.index("语音"))
+
+        section = _section_of(dialog, settings_mod, "click_sound")
+        assert _section_title(section) == "点击反馈"
+        assert interaction_page.isAncestorOf(section)
+        names = [r.objectName() for r in section.rows]
+        assert names[:4] == [
+            "settingRow_click_sound",
+            "settingRow_click_sound_pack",
+            "settingRow_click_sound_volume",
+            "settingRow_click_sound_preview",
+        ], "点击音效 4 行必须整组回到「点击反馈」且保持原顺序"
+        assert names.index("settingRow_click_self_talk") > 3, (
+            "点击音效 4 行原本排在 click_self_talk 之前"
+        )
+        # click_ 前缀里另有余额 / 点击台词绑定，同样留在「互动」。
+        for setting_id in ("click_balance", "click_talk_bindings"):
+            keep_row = dialog.findChild(settings_mod.SettingRow, f"settingRow_{setting_id}")
+            assert keep_row is not None, f"{setting_id} 行必须存在"
+            assert interaction_page.isAncestorOf(keep_row), f"{setting_id} 必须留在「互动」域"
+        for item in section.rows:
+            assert not voice_page.isAncestorOf(item), f"{item.objectName()} 不该落在「语音」域"
+    finally:
+        dialog.reject()
+        app.processEvents()
+
+
+def test_collision_sound_rows_return_to_pet_collision_groups(tmp_path, monkeypatch):
+    """碰撞音效 2 行回「桌宠」：开关紧随碰撞开关（多开碰撞组），音量随物理参数进
+    「碰撞参数（高级）」；「语音」域不再持有。"""
+    from PySide6.QtWidgets import QApplication
+
+    from pet import modern_settings_dialog as settings_mod
+    from pet.config import Config
+    from pet.modern_settings_dialog import ModernSettingsDialog
+
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(settings_mod.autostart_mod, "is_enabled", lambda: False)
+    dialog = ModernSettingsDialog(Config(tmp_path), include_ai=True)
+    try:
+        labels = [dialog.sidebar.item(i).text() for i in range(dialog.sidebar.count())]
+        pet_page = dialog.pages.widget(labels.index("桌宠"))
+        voice_page = dialog.pages.widget(labels.index("语音"))
+
+        primary = _section_of(dialog, settings_mod, "collision_sound_enabled")
+        assert _section_title(primary) == "多开碰撞"
+        assert pet_page.isAncestorOf(primary)
+        assert [r.objectName() for r in primary.rows] == [
+            "settingRow_collision_enabled",
+            "settingRow_collision_sound_enabled",
+        ], "碰撞音效开关必须紧跟在碰撞开关之后"
+
+        advanced = _section_of(dialog, settings_mod, "collision_sound_volume")
+        assert _section_title(advanced) == "碰撞参数（高级）"
+        assert advanced.toggle is not None, "碰撞参数是高级折叠组"
+        assert "settingRow_collision_sound_volume" in [
+            r.objectName() for r in advanced.rows
+        ]
+
+        for setting_id in ("collision_sound_enabled", "collision_sound_volume"):
+            item = dialog.findChild(settings_mod.SettingRow, f"settingRow_{setting_id}")
+            assert item is not None, f"{setting_id} 行必须存在"
+            assert pet_page.isAncestorOf(item)
+            assert not voice_page.isAncestorOf(item), f"{setting_id} 不该落在「语音」域"
+    finally:
+        dialog.reject()
+        app.processEvents()
+
+
+def test_agent_sound_rows_stay_in_agent_link_fold(tmp_path, monkeypatch):
+    """Agent 提示音效 6 行按主人拍板留在「自动化与联动」的 Agent 联动折叠框内，
+    不随「语音」域搬家。"""
+    from PySide6.QtWidgets import QApplication
+
+    from pet import modern_settings_dialog as settings_mod
+    from pet.config import Config
+    from pet.modern_settings_dialog import ModernSettingsDialog, SettingRow
+
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(settings_mod.autostart_mod, "is_enabled", lambda: False)
+    dialog = ModernSettingsDialog(Config(tmp_path), include_ai=True)
+    try:
+        labels = [dialog.sidebar.item(i).text() for i in range(dialog.sidebar.count())]
+        voice_page = dialog.pages.widget(labels.index("语音"))
+        automation_page = dialog.pages.widget(labels.index("自动化与联动"))
+        group_titles = [
+            section.findChild(settings_mod.QLabel, "sectionTitle").text()
+            for section in dialog.agent_link_box.groups
+        ]
+        assert "提示音效" in group_titles
+        for setting_id in (
+            "agent_sound_enabled",
+            "agent_sound_start",
+            "agent_sound_done",
+            "agent_sound_error",
+            "agent_sound_volume",
+            "agent_sound_cooldown",
+        ):
+            row = dialog.findChild(SettingRow, f"settingRow_{setting_id}")
+            assert row is not None, f"{setting_id} 行必须存在"
+            assert dialog.agent_link_box.isAncestorOf(row), (
+                f"{setting_id} 必须留在 Agent 联动折叠框内"
+            )
+            assert automation_page.isAncestorOf(row), (
+                f"{setting_id} 必须留在「自动化与联动」域"
+            )
+            assert not voice_page.isAncestorOf(row), (
+                f"{setting_id} 不应被「语音」域收走"
+            )
+    finally:
+        dialog.reject()
+        app.processEvents()
+
+
+def test_sound_and_festival_search_jump_to_owning_domains(tmp_path, monkeypatch):
+    """搜索按「语音」定稿口径跳域：点击音效 → 互动、碰撞音效 → 桌宠、
+    节日提醒 / 语音报时 → 语音、Agent 提示音 → 自动化与联动。"""
+    from PySide6.QtWidgets import QApplication
+
+    from pet import modern_settings_dialog as settings_mod
+    from pet.config import Config
+    from pet.modern_settings_dialog import ModernSettingsDialog
+
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(settings_mod.autostart_mod, "is_enabled", lambda: False)
+    dialog = ModernSettingsDialog(Config(tmp_path), include_ai=True)
+    try:
+        # (查询词, 应跳到的域, 命中行要不要断言可见)：命中后搜索会**先**把命中行
+        # 所在的折叠框 / advanced 组展开、再把页内标签切到它所在的那一页
+        #（``modern_settings_dialog._search_settings``），所以「行藏在默认收起的
+        # 后面」已不是命中行不可见的理由；真正还不可见的只有被前置开关挡住的行，
+        # 那类行搜索状态栏会写明「需先开启「X」」。第三列的 False（碰撞音量）是
+        # 第一刀之前的留痕：当时它在默认收起的「碰撞参数（高级）」后面、搜索也不
+        # 展开，故没给它可见断言；现在它随页内标签一起可见，这一条只是不再断言。
+        cases = (
+            ("点击音效", "互动", True),
+            ("音效音源", "互动", True),
+            ("试听音效", "互动", True),
+            ("click_sound_volume", "互动", True),
+            ("碰撞音效", "桌宠", True),
+            ("碰撞音量", "桌宠", False),
+            ("报时频率", "语音", True),
+            ("节日提醒", "语音", True),
+            ("立即试听", "语音", True),
+            ("agent_sound_enabled", "自动化与联动", True),
+        )
+        for query, domain, should_be_visible in cases:
+            dialog.search_edit.setText(query)
+            app.processEvents()
+            assert dialog.sidebar.currentItem().text() == domain, (
+                f"搜索「{query}」必须跳到「{domain}」域"
+            )
+            page = dialog.pages.widget(dialog.sidebar.currentRow())
+            match = dialog._search_matches[dialog._search_index]
+            assert page.isAncestorOf(match), f"搜索「{query}」命中的行不在「{domain}」域"
+            if should_be_visible:
+                assert match.isVisibleTo(page), (
+                    f"搜索「{query}」命中的行在「{domain}」域里不可见"
+                )
+    finally:
+        dialog.reject()
+        app.processEvents()
+
+
+def test_menu_domain_uses_in_page_task_tabs_without_changing_sidebar(tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QApplication
+
+    from pet import modern_settings_dialog as settings_mod
+    from pet.config import Config
+    from pet.modern_settings_dialog import ModernSettingsDialog, SettingRow, SettingsTabContainer
+
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(settings_mod.autostart_mod, "is_enabled", lambda: False)
+    dialog = ModernSettingsDialog(Config(tmp_path), include_ai=True)
+
+    expected_sidebar = ["常规", "桌宠", "互动", "菜单", "桌面组件", "功能", "AI 与对话", "自动化与联动", "语音", "文件识别", "更新"]
+    assert [dialog.sidebar.item(i).text() for i in range(dialog.sidebar.count())] == expected_sidebar
+    tabs = dialog.pages.widget(3).findChild(SettingsTabContainer, "settingsTaskTabs")
+    assert tabs is not None
+    assert tabs.keys() == ("layout", "launcher", "appearance")
+    assert tabs.labels() == ("菜单编排", "快捷启动", "外观")
+
+    layout_row = dialog.findChild(SettingRow, "settingRow_context_menu_layout")
+    launcher_row = dialog.findChild(SettingRow, "settingRow_quick_launch_apps")
+    appearance_row = dialog.findChild(SettingRow, "settingRow_menu_theme")
+    assert tabs.key_for_descendant(layout_row) == "layout"
+    assert tabs.key_for_descendant(launcher_row) == "launcher"
+    assert tabs.key_for_descendant(appearance_row) == "appearance"
+
+    dialog.search_edit.setText("应用快捷启动")
+    app.processEvents()
+    assert dialog.sidebar.currentItem().text() == "菜单"
+    assert tabs.currentKey() == "launcher"
+    dialog.reject()
+    app.processEvents()
+
+
+def test_network_info_entry_status_follows_its_setting(tmp_path, monkeypatch):
+    """入口开关关掉时编排器状态列显示「已停用」（不是「此平台不可用」，也不消失）。
+
+    Runtime Disabled 契约（CONTEXT.md）：开关关掉保留位置、置灰并解释；能力不可用
+    才是另一回事。这里同时钉住"配置态初始状态"与"页面上切换即时生效"两条路径。
+    """
+    from PySide6.QtWidgets import QApplication
+
+    from pet import modern_settings_dialog as settings_mod
+    from pet.config import Config
+    from pet.modern_settings_dialog import ModernSettingsDialog
+
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(settings_mod.autostart_mod, "is_enabled", lambda: False)
+
+    off_cfg = Config(tmp_path / "off")
+    off_cfg.set("network_info_menu_enabled", False)
+    # #271：空身份会话按 slot0 分流，全局键读的是路由视图另建的主配置（初值只取盘），
+    # 内存预置不再可见——预置必须落盘。
+    assert off_cfg.save() is True
+    dialog = ModernSettingsDialog(off_cfg, include_ai=True)
+    try:
+        item = dialog.menu_layout_editor.item_for_action("network_info")
+        assert item is not None, "编排器里必须保留该项（不是从树里消失）"
+        assert item.text(1) == "已停用"
+
+        dialog.network_info_menu_check.setChecked(True)
+        app.processEvents()
+        assert item.text(1) == "已启用"
+    finally:
+        dialog.reject()
+        app.processEvents()
+
+    monkeypatch.setattr(settings_mod.autostart_mod, "is_enabled", lambda: False)
+    on_cfg = Config(tmp_path / "on")
+    dialog = ModernSettingsDialog(on_cfg, include_ai=True)
+    try:
+        assert dialog.menu_layout_editor.item_for_action("network_info").text(1) == "已启用"
+        dialog.network_info_menu_check.setChecked(False)
+        app.processEvents()
+        assert dialog.menu_layout_editor.item_for_action("network_info").text(1) == "已停用"
+    finally:
+        dialog.reject()
+        app.processEvents()
+
+
+def test_runtime_toggles_refresh_menu_status_without_rewriting_tree(tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QApplication
+
+    from pet import modern_settings_dialog as settings_mod
+    from pet.config import Config
+    from pet.modern_settings_dialog import ModernSettingsDialog
+
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(settings_mod.autostart_mod, "is_enabled", lambda: False)
+    dialog = ModernSettingsDialog(Config(tmp_path), include_ai=True)
+    before = dialog.menu_layout_editor.value()["nodes"]
+
+    dialog.egg_enabled_check.setChecked(False)
+    dialog.quick_launch_editor.list.clear()
+    dialog.quick_launch_editor._sync_content_height()
+    app.processEvents()
+
+    assert dialog.menu_layout_editor.item_for_action("ojingjing").text(1) == "已停用"
+    assert dialog.menu_layout_editor.item_for_action("quick_launch").text(1) == "已停用"
+    assert dialog.menu_layout_editor.value()["nodes"] == before
+    dialog.reject()
+    app.processEvents()
+
+
+def test_advanced_setting_groups_use_single_collapsed_disclosure_layer(tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QApplication, QToolButton
+
+    from pet import modern_settings_dialog as settings_mod
+    from pet.config import Config
+    from pet.modern_settings_dialog import (
+        ModernSettingsDialog,
+        SettingsDisclosureHeader,
+        SettingsSection,
+    )
+
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(settings_mod.autostart_mod, "is_enabled", lambda: False)
+    dialog = ModernSettingsDialog(Config(tmp_path), include_ai=True)
+
+    color_toggle = next(
+        button for button in dialog.findChildren(SettingsDisclosureHeader)
+        if button.text() == "高级配色"
+    )
+    assert not dialog.findChildren(QToolButton, "advancedSectionToggle")
+    color_section = color_toggle.parentWidget()
+    assert isinstance(color_section, SettingsSection)
+    assert color_section.card.isHidden()
+    assert not color_toggle.isChecked()
+
+    color_toggle.click()
+
+    assert not color_section.card.isHidden()
+    assert color_toggle.isChecked()
+    dialog.reject()
+    app.processEvents()
+
+
+def test_ai_settings_content_expands_to_the_shared_page_width(tmp_path, monkeypatch):
+    """AI 域的内容跟页头共用同一个宽度契约，不是自己缩成一条窄列。
+
+    契约 = ``min(CONTENT_READING_MAX_WIDTH, 滚动视口宽)``：宽窗下内容被阅读宽度封顶
+    （见 ``settings_widgets.CONTENT_READING_MAX_WIDTH``），窄窗下就是视口宽。"共用"
+    在这里的判据是**与页头逐像素同宽**——页头与内容是同一条宽度契约的两个呈现面
+    （``_SettingsPageShell``）。
+    """
+    from PySide6.QtWidgets import QApplication
+
+    from pet import modern_settings_dialog as settings_mod
+    from pet.config import Config
+    from pet.modern_settings_dialog import ModernSettingsDialog
+    from pet.settings_widgets import CONTENT_READING_MAX_WIDTH
+
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(settings_mod.autostart_mod, "is_enabled", lambda: False)
+    dialog = ModernSettingsDialog(Config(tmp_path), include_ai=True)
+    dialog.resize(1100, 760)
+    dialog.sidebar.setCurrentRow(6)  # 「AI 与对话」域（「功能」域在其前）
+    dialog.show()
+    for _turn in range(3):  # 页头宽度跟着视口走，布局要多落一拍（见 _SettingsPageShell）
+        app.processEvents()
+
+    ai_domain = dialog.findChild(settings_mod.QWidget, "settingsDomain_ai")
+    assert ai_domain is not None
+    page = dialog.pages.currentWidget()
+    header = page.findChild(settings_mod.QWidget, "pageHeader")
+    expected = min(CONTENT_READING_MAX_WIDTH, ai_domain.parentWidget().width())
+    assert ai_domain.width() == expected, (
+        f"AI 域内容宽 {ai_domain.width()}px ≠ 共用契约 {expected}px")
+    assert header.width() == expected, "页头与内容必须同宽（一个契约两处呈现）"
+    assert not dialog.ai_page.isVisible()
+    dialog.reject()
+    app.processEvents()
+
+
+def test_settings_visual_hierarchy_uses_shared_product_tokens(tmp_path, monkeypatch):
+    from PySide6.QtCore import QSize
+    from PySide6.QtWidgets import QApplication
+
+    from pet import modern_settings_dialog as settings_mod
+    from pet.config import Config
+    from pet.modern_settings_dialog import ModernSettingsDialog, SettingRow
+
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(settings_mod.autostart_mod, "is_enabled", lambda: False)
+    dialog = ModernSettingsDialog(Config(tmp_path), include_ai=True)
+    dialog.show()
+    app.processEvents()
+
+    assert dialog.findChild(settings_mod.QFrame, "sidebarPane").width() == 200
+    assert dialog.sidebar.iconSize() == QSize(18, 18)
+    page_title = dialog.pages.currentWidget().findChild(settings_mod.QLabel, "pageTitle")
+    section_title = dialog.pages.currentWidget().findChild(settings_mod.QLabel, "sectionTitle")
+    row = dialog.findChild(SettingRow, "settingRow_autostart")
+    assert page_title.font().pixelSize() == 22
+    # 2026-10-08 视觉层级调整：组标题 13px → 15px（描述小字 12px 另立一行，见下）。
+    assert section_title.font().pixelSize() == 15
+    description = dialog.pages.currentWidget().findChild(settings_mod.QLabel, "sectionDescription")
+    assert description is not None and description.font().pixelSize() == 12
+    assert row.label.font().pixelSize() == 13
+    assert row.label.font().weight() == 500
+    assert row.hint_label.font().pixelSize() == 12
+    dialog.reject()
+    app.processEvents()
+
+
+def test_wide_settings_title_tracks_the_centered_page_content(tmp_path, monkeypatch):
+    """页头标题跟着内容走：宽窗留白两侧对称，标题不漂到自己的位置上。
+
+    判据是**同宽**（页头与内容取同一个宽度契约，见 ``_SettingsPageShell``）；左边缘
+    允许"半个滚动条"的差——页头由页布局居中、内容由滚动视口居中，两条链天生差
+    ``滚动条宽 / 2``（有滚动条的页上 4px，无滚动条的页上逐像素相等）。
+    """
+    from PySide6.QtCore import QPoint
+    from PySide6.QtWidgets import QApplication, QScrollArea
+
+    from pet import modern_settings_dialog as settings_mod
+    from pet.config import Config
+    from pet.modern_settings_dialog import ModernSettingsDialog
+
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(settings_mod.autostart_mod, "is_enabled", lambda: False)
+    dialog = ModernSettingsDialog(Config(tmp_path), include_ai=True)
+    dialog.resize(1600, 900)
+    dialog.show()
+    app.processEvents()
+
+    for width, height in ((1600, 900), (720, 700)):
+        dialog.resize(width, height)
+        for _turn in range(3):  # 页头宽度跟着视口走，布局要多落一拍
+            app.processEvents()
+        page = dialog.pages.currentWidget()
+        title = page.findChild(settings_mod.QLabel, "pageTitle")
+        scroll = page.findChild(QScrollArea, "settingsScroll")
+        content = scroll.widget()
+        title_x = title.mapTo(page, QPoint(0, 0)).x()
+        content_x = content.mapTo(page, QPoint(0, 0)).x()
+        extent = max(0, scroll.width() - scroll.viewport().width())
+        assert abs(title_x - content_x) <= extent, (
+            f"{width}×{height}：标题 {title_x} 与内容 {content_x} 错开超过滚动条宽 {extent}")
+        assert title.width() == content.width(), (
+            f"{width}×{height}：标题 {title.width()}px / 内容 {content.width()}px 不同宽")
+    dialog.reject()
+    app.processEvents()
+
+
+def test_setting_rows_name_and_describe_their_controls_for_accessibility(tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QApplication
+
+    from pet import modern_settings_dialog as settings_mod
+    from pet.config import Config
+    from pet.modern_settings_dialog import ModernSettingsDialog, SettingRow
+
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(settings_mod.autostart_mod, "is_enabled", lambda: False)
+    dialog = ModernSettingsDialog(Config(tmp_path), include_ai=True)
+    row = dialog.findChild(SettingRow, "settingRow_autostart")
+
+    assert row.label.buddy() is row.control
+    assert row.label.wordWrap()
+    assert row.control.accessibleName() == row.label.text()
+    # 可访问说明 = 行内**全部**可读文案：说明 + 作用域标注（标注只是从说明末尾换到独立
+    # 一行呈现，读屏听到的内容不许因此变少，见 SettingRow.set_scope_note）。
+    assert row.control.accessibleDescription() == (
+        row.hint_label.text() + row.scope_note.text())
+    assert "影响所有桌宠" in row.control.accessibleDescription()
+    assert "QPushButton:focus" in dialog.styleSheet()
+
+    dialog.reject()
+    app.processEvents()
+
+
+def test_setting_row_stacks_a_wide_control_before_copy_becomes_unreadable():
+    from PySide6.QtWidgets import QApplication, QPushButton
+
+    from pet.modern_settings_dialog import SettingRow
+
+    app = QApplication.instance() or QApplication([])
+    control = QPushButton("宽控件")
+    control.setFixedWidth(340)
+    row = SettingRow(
+        "responsive",
+        "跨平台同步与自动恢复策略的超长本地化标题示例",
+        "说明文字必须保持可读。",
+        control,
+    )
+    row.resize(500, 180)
+    row.show()
+    app.processEvents()
+
+    assert control.y() > row.label.y() + row.label.height()
+    assert row.property("responsiveStacked") is True
+
+    row.resize(900, 180)
+    app.processEvents()
+
+    assert control.x() > row.label.x()
+    assert row.property("responsiveStacked") is False
+    row.close()
+    app.processEvents()
+
+
+def test_compact_ai_provider_controls_stay_inside_their_setting_row(tmp_path, monkeypatch):
+    from PySide6.QtCore import QPoint
+    from PySide6.QtWidgets import QApplication, QScrollArea
+
+    from pet import modern_settings_dialog as settings_mod
+    from pet.config import Config
+    from pet.modern_settings_dialog import ModernSettingsDialog, SettingRow
+
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(settings_mod.autostart_mod, "is_enabled", lambda: False)
+    dialog = ModernSettingsDialog(Config(tmp_path), include_ai=True)
+    dialog.resize(720, 760)
+    dialog.sidebar.setCurrentRow(6)  # 「AI 与对话」域（「功能」域在其前）
+    for control in (
+        dialog.ai_page.provider_combo,
+        dialog.ai_page.add_provider_btn,
+        dialog.ai_page.delete_provider_btn,
+    ):
+        font = control.font()
+        font.setPixelSize(17)
+        control.setFont(font)
+    dialog.ai_page.add_provider_btn.setText("添加新的 Provider")
+    dialog.ai_page.delete_provider_btn.setText("删除当前 Provider")
+    dialog.show()
+    dialog.resize(721, 760)
+    app.processEvents()
+    dialog.resize(720, 760)
+    app.processEvents()
+
+    row = dialog.findChild(SettingRow, "settingRow_provider_list")
+    provider_controls = dialog.ai_page.provider_combo.parentWidget()
+    left = provider_controls.mapTo(row, QPoint(0, 0)).x()
+    assert left >= 16
+    assert left + provider_controls.width() <= row.width() - 16
+    scroll = row.parentWidget()
+    while scroll is not None and not isinstance(scroll, QScrollArea):
+        scroll = scroll.parentWidget()
+    assert scroll is not None
+    row_left = row.mapTo(scroll.viewport(), QPoint(0, 0)).x()
+    assert row_left >= 0
+    assert row_left + row.width() <= scroll.viewport().width()
+    dialog.reject()
+    app.processEvents()
+
+
+def test_responsive_action_row_can_stack_wide_actions_vertically():
+    from PySide6.QtWidgets import QApplication, QPushButton
+
+    from pet.modern_settings_dialog import ModernSelect, ResponsiveActionRow
+
+    app = QApplication.instance() or QApplication([])
+    primary = ModernSelect(width=230)
+    first = QPushButton("第一个很长的本地化操作")
+    second = QPushButton("第二个很长的本地化操作")
+    first.setMinimumWidth(260)
+    second.setMinimumWidth(260)
+    row = ResponsiveActionRow(primary, [first, second])
+    row.setFixedWidth(454)
+    row.resize(454, 180)
+    row.show()
+    app.processEvents()
+
+    assert row.minimumSizeHint().width() <= 260
+    assert row.property("responsiveMode") == "compact"
+    assert first.y() < second.y()
+    assert first.geometry().right() <= row.rect().right()
+    assert second.geometry().right() <= row.rect().right()
+    row.close()
+    app.processEvents()
+
+
+def test_responsive_action_row_inline_mode_does_not_reserve_compact_height():
+    from PySide6.QtWidgets import QApplication, QPushButton
+
+    from pet.modern_settings_dialog import ModernSelect, ResponsiveActionRow
+
+    app = QApplication.instance() or QApplication([])
+    primary = ModernSelect(width=230)
+    first = QPushButton("新增")
+    second = QPushButton("删除")
+    row = ResponsiveActionRow(primary, [first, second])
+    row.setFixedWidth(800)
+    row.show()
+    app.processEvents()
+
+    expected_height = max(
+        widget.minimumHeight() or widget.minimumSizeHint().height()
+        for widget in (primary, first, second)
+    )
+    assert row.property("responsiveMode") == "inline"
+    assert row.minimumSizeHint().height() == expected_height
+    row.close()
+    app.processEvents()
+
+
+def test_compact_agent_sound_controls_reflow_inside_their_setting_row(tmp_path, monkeypatch):
+    from PySide6.QtCore import QPoint
+    from PySide6.QtWidgets import QApplication, QScrollArea
+
+    from pet import modern_settings_dialog as settings_mod
+    from pet.config import Config
+    from pet.modern_settings_dialog import ModernSettingsDialog, SettingRow
+
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(settings_mod.autostart_mod, "is_enabled", lambda: False)
+    dialog = ModernSettingsDialog(Config(tmp_path), include_ai=False)
+    dialog.agent_sound_check.setChecked(True)
+    # 2026-10-07 第一刀：Agent 折叠框改默认折叠，折叠态下的子行不参与布局（宽度是陈旧
+    # 值），本用例量的是可见态的行内回流，故先展开（几何断言本身逐字不变）。
+    dialog.agent_link_box.set_expanded(True)
+    dialog.resize(720, 760)
+    automation_index = next(
+        index for index in range(dialog.sidebar.count())
+        if dialog.sidebar.item(index).text() == "自动化与联动"
+    )
+    dialog.sidebar.setCurrentRow(automation_index)
+    for control in (
+        dialog.agent_sound_start_picker,
+        dialog.agent_sound_start_preview,
+    ):
+        font = control.font()
+        font.setPixelSize(17)
+        control.setFont(font)
+    dialog.show()
+    dialog.resize(721, 760)
+    app.processEvents()
+    dialog.resize(720, 760)
+    app.processEvents()
+
+    row = dialog.findChild(SettingRow, "settingRow_agent_sound_start")
+    for control in (
+        dialog.agent_sound_start_check,
+        dialog.agent_sound_start_picker,
+        dialog.agent_sound_start_preview,
+    ):
+        left = control.mapTo(row, QPoint(0, 0)).x()
+        assert left >= 16
+        assert left + control.width() <= row.width() - 16
+    assert dialog.agent_sound_start_widget.property("responsiveStacked") is True
+    scroll = row.parentWidget()
+    while scroll is not None and not isinstance(scroll, QScrollArea):
+        scroll = scroll.parentWidget()
+    assert scroll is not None
+    row_left = row.mapTo(scroll.viewport(), QPoint(0, 0)).x()
+    assert row_left >= 0
+    assert row_left + row.width() <= scroll.viewport().width()
+    dialog.reject()
+    app.processEvents()
+
+
+def test_settings_domains_use_semantic_sidebar_icons():
+    from pet.modern_settings_dialog import SETTINGS_DOMAIN_NAV
+
+    assert SETTINGS_DOMAIN_NAV == (
+        ("常规", "settings"),
+        ("桌宠", "pet"),
+        ("互动", "interaction"),
+        ("菜单", "application"),
+        ("桌面组件", "island"),
+        ("功能", "template"),
+        ("AI 与对话", "chat"),
+        ("自动化与联动", "automation"),
+        ("语音", "sound"),
+        ("文件识别", "file"),
+        ("更新", "update"),
+    )
+
+
+def test_settings_menu_page_has_no_menu_version_selector(tmp_path, monkeypatch):
+    """「菜单版本（新版 / 旧版）」下拉已随旧版菜单退役：设置页不再有它，
+    保存也不再把已退役的模板键写回配置。
+
+    （旧用例 `test_settings_menu_page_persists_legacy_compatibility_mode` 断言
+    的正是"切到旧版并落盘"，随旧版菜单一起删除。）
+    """
+    from PySide6.QtWidgets import QApplication
+
+    from pet import modern_settings_dialog as settings_mod
+    from pet.config import Config
+    from pet.modern_settings_dialog import ModernSettingsDialog
+
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(settings_mod.autostart_mod, "is_enabled", lambda: False)
+    config = Config(tmp_path)
+    dialog = ModernSettingsDialog(config, include_ai=False)
+
+    assert not hasattr(dialog, "menu_template_select"), (
+        "菜单版本下拉必须随旧版菜单一起删除（切不回旧版了，留着就是死开关）")
+    dialog.save_exit_button.click()
+    assert "context_menu_template" not in config.data
+    assert "context_menu_template" not in Config(tmp_path).data
+    app.processEvents()
+
+
+def test_saving_unchanged_default_menu_keeps_layout_override_empty(tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QApplication
+
+    from pet import modern_settings_dialog as settings_mod
+    from pet.config import Config
+    from pet.modern_settings_dialog import ModernSettingsDialog
+
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(settings_mod.autostart_mod, "is_enabled", lambda: False)
+    dialog = ModernSettingsDialog(Config(tmp_path), include_ai=False)
+
+    dialog.save_exit_button.click()
+
+    assert Config(tmp_path).get("context_menu_layout") is None
+    app.processEvents()
+
+
+def test_missing_default_resource_returns_minimum_safe_menu(monkeypatch):
+    import pet.menu_layout as layout_mod
+
+    monkeypatch.setattr(
+        layout_mod,
+        "load_default_menu_layout",
+        lambda: (_ for _ in ()).throw(OSError("missing resource")),
+    )
+
+    result = layout_mod.resolve_menu_layout(
+        None,
+        registered_actions={"modern_settings", "quit"},
+        available_actions={"modern_settings", "quit"},
+    )
+
+    assert result.source == "fallback"
+    assert result.diagnostics == ("default-layout-unavailable",)
+    assert [node["id"] for node in result.nodes] == ["modern_settings", "quit"]
+
+
+def test_menu_preview_uses_resolver_and_omits_empty_submenu(tmp_path, monkeypatch):
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication
+
+    from pet import modern_settings_dialog as settings_mod
+    from pet.config import Config
+    from pet.modern_settings_dialog import ModernSettingsDialog
+
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(settings_mod.autostart_mod, "is_enabled", lambda: False)
+    dialog = ModernSettingsDialog(Config(tmp_path), include_ai=False)
+    editor = dialog.menu_layout_editor
+    controls = next(
+        editor.tree.topLevelItem(i)
+        for i in range(editor.tree.topLevelItemCount())
+        if (editor.tree.topLevelItem(i).data(0, Qt.ItemDataRole.UserRole) or {}).get("id") == "pet_controls"
+    )
+    for index in range(controls.childCount()):
+        controls.child(index).setCheckState(0, Qt.CheckState.Unchecked)
+
+    preview_labels = [
+        editor.preview.topLevelItem(i).text(0)
+        for i in range(editor.preview.topLevelItemCount())
+    ]
+    assert "桌宠控制" not in preview_labels
+    dialog.reject()
+    app.processEvents()
+
+
+def test_menu_preview_refreshes_after_tree_shape_changes():
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication
+
+    from pet.modern_settings_dialog import MenuLayoutEditor
+
+    app = QApplication.instance() or QApplication([])
+    editor = MenuLayoutEditor(None)
+    controls = next(
+        editor.tree.topLevelItem(index)
+        for index in range(editor.tree.topLevelItemCount())
+        if (
+            editor.tree.topLevelItem(index).data(0, Qt.ItemDataRole.UserRole) or {}
+        ).get("id")
+        == "pet_controls"
+    )
+    action = controls.child(0)
+    action_label = action.text(0)
+
+    controls.removeChild(action)
+    editor.tree.addTopLevelItem(action)
+    app.processEvents()
+
+    preview_roots = [
+        editor.preview.topLevelItem(index)
+        for index in range(editor.preview.topLevelItemCount())
+    ]
+    preview_controls = next(item for item in preview_roots if item.text(0) == "桌宠控制")
+    assert action_label in [item.text(0) for item in preview_roots]
+    assert action_label not in [
+        preview_controls.child(index).text(0)
+        for index in range(preview_controls.childCount())
+    ]
+    editor.close()
+    app.processEvents()
+
+
+def test_menu_preview_and_runtime_qmenu_share_the_same_layout_structure():
+    from copy import deepcopy
+
+    from PySide6.QtWidgets import QApplication, QMenu
+
+    from pet.context_menus.modern import build_modern_menu
+    from pet.context_menus.registry import MENU_ACTIONS
+    from pet.modern_settings_dialog import MenuLayoutEditor
+
+    layout = deepcopy(load_default_menu_layout())
+    layout["layout_id"] = "user"
+    visible_root_ids = {"chat", "pet_controls", "modern_settings", "quit"}
+    for node in layout["nodes"]:
+        node["visible"] = node["id"] in visible_root_ids
+        if node["id"] == "pet_controls":
+            node["label"] = "常用桌宠操作"
+            for child in node["children"]:
+                child["visible"] = child["id"] == "drag_physics"
+
+    class FakeConfig:
+        def get(self, key, default=None):
+            values = {
+                "context_menu_layout": layout,
+                "menu_easter_egg": {"enabled": False},
+                "quick_launch_apps": [],
+            }
+            return values.get(key, default)
+
+    class FakePet:
+        cfg = FakeConfig()
+        drag_physics = False
+        on_open_chat = lambda self: None
+        on_open_modern_settings = lambda self: None
+        set_drag_physics = lambda self, _enabled: None
+        request_quit = lambda self: None
+
+    def preview_shape(parent):
+        return [
+            (
+                parent.child(index).text(0),
+                preview_shape(parent.child(index)),
+            )
+            for index in range(parent.childCount())
+            if parent.child(index).text(0) != "────────"
+        ]
+
+    def runtime_shape(menu, nodes):
+        actions = [action for action in menu.actions() if not action.isSeparator()]
+        assert len(actions) == len(nodes)
+        return [
+            (
+                action.text(),
+                runtime_shape(action.menu(), node["children"])
+                if node.get("type") == "submenu"
+                else [],
+            )
+            for action, node in zip(actions, nodes)
+        ]
+
+    app = QApplication.instance() or QApplication([])
+    editor = MenuLayoutEditor(layout, available_actions=MENU_ACTIONS.ids)
+    runtime_menu = QMenu()
+    build_modern_menu(runtime_menu, FakePet())
+    resolved = resolve_menu_layout(
+        layout,
+        registered_actions=MENU_ACTIONS.ids,
+        available_actions=MENU_ACTIONS.available_ids(FakePet()),
+    )
+
+    assert preview_shape(editor.preview.invisibleRootItem()) == runtime_shape(
+        runtime_menu, resolved.nodes
+    )
+    runtime_menu.close()
+    editor.close()
+    app.processEvents()
+
+
+def test_menu_editor_switches_between_stacked_and_split_layouts():
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication
+
+    from pet.modern_settings_dialog import MenuLayoutEditor
+
+    app = QApplication.instance() or QApplication([])
+    editor = MenuLayoutEditor(None)
+    editor.resize(560, 420)
+    editor.show()
+    app.processEvents()
+    assert editor.findChild(type(editor.split), "menuEditorSplit").orientation() == Qt.Orientation.Vertical
+    assert editor.tree.isColumnHidden(2)
+
+    editor.resize(900, 420)
+    app.processEvents()
+    assert editor.split.orientation() == Qt.Orientation.Horizontal
+    assert not editor.tree.isColumnHidden(2)
+    editor.close()
+    app.processEvents()
+
+
+def test_menu_editor_uses_settings_cards_instead_of_native_table_chrome():
+    from PySide6.QtWidgets import QApplication, QHeaderView
+
+    from pet.modern_settings_dialog import MenuLayoutEditor
+
+    app = QApplication.instance() or QApplication([])
+    editor = MenuLayoutEditor(None)
+    editor.resize(900, 520)
+    editor.show()
+    app.processEvents()
+
+    assert editor.tree.objectName() == "menuLayoutTree"
+    assert editor.tree.uniformRowHeights()
+    assert editor.tree.indentation() == 18
+    assert all(
+        editor.tree.header().sectionResizeMode(column) == QHeaderView.ResizeMode.Interactive
+        for column in range(3)
+    )
+    assert not editor.tree.header().stretchLastSection()
+    assert editor.tree.columnWidth(2) == 92
+    assert editor.preview.header().isHidden()
+    assert editor.preview.uniformRowHeights()
+    assert editor.preview.indentation() == 18
+    assert editor.findChild(
+        type(editor.preview_label), "menuLayoutPreviewLabel"
+    ).text() == "实时菜单预览"
+
+    editor.close()
+    app.processEvents()
+
+
+def test_wide_menu_editor_expands_and_groups_commands_into_dropdowns(tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QApplication
+
+    from pet import modern_settings_dialog as settings_mod
+    from pet.config import Config
+    from pet.modern_settings_dialog import ModernSettingsDialog
+
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(settings_mod.autostart_mod, "is_enabled", lambda: False)
+    dialog = ModernSettingsDialog(Config(tmp_path), include_ai=True)
+    menu_index = next(
+        index for index in range(dialog.sidebar.count())
+        if dialog.sidebar.item(index).text() == "菜单"
+    )
+    dialog.sidebar.setCurrentRow(menu_index)
+    dialog.resize(1600, 1000)
+    dialog.show()
+    app.processEvents()
+
+    editor = dialog.menu_layout_editor
+    assert editor.width() >= 1100
+    assert editor.tree.height() >= 320
+    assert editor.editor_label.text() == "菜单结构"
+    assert editor.preview_label.text() == "实时菜单预览"
+    grouped = (
+        (editor.order_button, "排序"),
+        (editor.move_button, "移动到"),
+        (editor.submenu_button, "插入"),
+        (editor.customize_button, "自定义"),
+        (editor.more_button, "更多"),
+    )
+    assert all(button.text() == label for button, label in grouped)
+    assert all(button.popupMenu() is not None for button, _label in grouped)
+
+    dialog.resize(720, 700)
+    app.processEvents()
+    assert editor.split.orientation() == settings_mod.Qt.Orientation.Vertical
+    dialog.reject()
+    app.processEvents()
+
+
+def test_menu_editor_compact_action_bar_keeps_every_button_reachable():
+    from PySide6.QtCore import QPoint
+    from PySide6.QtWidgets import QApplication
+
+    from pet.modern_settings_dialog import MenuLayoutEditor
+
+    app = QApplication.instance() or QApplication([])
+    editor = MenuLayoutEditor(None)
+    editor.resize(420, 620)
+    editor.show()
+    app.processEvents()
+    assert editor.width() <= 420
+
+    buttons = (
+        editor.order_button,
+        editor.move_button,
+        editor.submenu_button,
+        editor.customize_button,
+        editor.more_button,
+    )
+    assert all(button.isVisible() for button in buttons)
+    assert all(
+        button.mapTo(editor, QPoint(0, 0)).x() + button.width() <= editor.width()
+        for button in buttons
+    )
+    assert len({button.mapTo(editor, QPoint(0, 0)).y() for button in buttons}) == 3
+    editor.close()
+    app.processEvents()
+
+
+def test_non_windows_settings_does_not_create_orphan_windows_control(tmp_path, monkeypatch):
+    import sys
+
+    from PySide6.QtWidgets import QApplication
+
+    from pet import modern_settings_dialog as settings_mod
+    from pet.config import Config
+    from pet.modern_settings_dialog import ModernSettingsDialog
+
+    if sys.platform == "win32":
+        return
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(settings_mod.autostart_mod, "is_enabled", lambda: False)
+    dialog = ModernSettingsDialog(Config(tmp_path), include_ai=True)
+
+    assert dialog.cursor_hidden_passthrough_check is None
+    dialog.reject()
+    app.processEvents()
+
+
+def test_compact_settings_menu_action_bar_fits_scroll_viewport(tmp_path, monkeypatch):
+    from PySide6.QtCore import QPoint
+    from PySide6.QtWidgets import QApplication, QScrollArea
+
+    from pet import modern_settings_dialog as settings_mod
+    from pet.config import Config
+    from pet.modern_settings_dialog import ModernSettingsDialog
+
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(settings_mod.autostart_mod, "is_enabled", lambda: False)
+    dialog = ModernSettingsDialog(Config(tmp_path), include_ai=True)
+    dialog.sidebar.setCurrentRow(3)
+    dialog.resize(1100, 700)
+    dialog.show()
+    app.processEvents()
+    dialog.resize(720, 700)
+    app.processEvents()
+    editor = dialog.menu_layout_editor
+    scroll = editor.parentWidget()
+    while scroll is not None and not isinstance(scroll, QScrollArea):
+        scroll = scroll.parentWidget()
+    assert scroll is not None
+
+    for button in (
+        editor.order_button,
+        editor.move_button,
+        editor.submenu_button,
+        editor.customize_button,
+        editor.more_button,
+    ):
+        left = button.mapTo(scroll.viewport(), QPoint(0, 0)).x()
+        assert left >= 0
+        assert left + button.width() <= scroll.viewport().width()
+        dialog_left = button.mapTo(dialog, QPoint(0, 0)).x()
+        assert dialog_left + button.width() <= dialog.width()
+    dialog.reject()
+    app.processEvents()
+
+
+def test_menu_editor_retains_but_marks_platform_unavailable_action(tmp_path, monkeypatch):
+    import sys
+
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication
+
+    from pet import modern_settings_dialog as settings_mod
+    from pet.config import Config
+    from pet.modern_settings_dialog import ModernSettingsDialog
+
+    if sys.platform == "win32":
+        return
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(settings_mod.autostart_mod, "is_enabled", lambda: False)
+    dialog = ModernSettingsDialog(Config(tmp_path), include_ai=True)
+    item = dialog.menu_layout_editor.item_for_action("proactive_screen")
+
+    assert item is not None
+    assert item.text(1) == "此平台不可用"
+    assert not item.flags() & Qt.ItemFlag.ItemIsEnabled
+    assert "主动识屏" not in [
+        dialog.menu_layout_editor.preview.topLevelItem(i).text(0)
+        for i in range(dialog.menu_layout_editor.preview.topLevelItemCount())
+    ]
+    dialog.reject()
+    app.processEvents()
+
+
+def test_menu_editor_keeps_recovery_actions_visible_but_movable(tmp_path, monkeypatch):
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication
+
+    from pet import modern_settings_dialog as settings_mod
+    from pet.config import Config
+    from pet.modern_settings_dialog import ModernSettingsDialog
+
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(settings_mod.autostart_mod, "is_enabled", lambda: False)
+    dialog = ModernSettingsDialog(Config(tmp_path), include_ai=False)
+    for action_id in ("modern_settings", "quit"):
+        item = dialog.menu_layout_editor.item_for_action(action_id)
+        assert item.checkState(0) == Qt.CheckState.Checked
+        assert not item.flags() & Qt.ItemFlag.ItemIsUserCheckable
+        assert item.flags() & Qt.ItemFlag.ItemIsDragEnabled
+    dialog.reject()
+    app.processEvents()
+
+
+def test_menu_editor_actions_cannot_accept_dropped_children():
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication
+
+    from pet.modern_settings_dialog import MenuLayoutEditor
+
+    app = QApplication.instance() or QApplication([])
+    editor = MenuLayoutEditor(None)
+
+    action = editor.item_for_action("chat")
+    assert action.flags() & Qt.ItemFlag.ItemIsDragEnabled
+    assert not action.flags() & Qt.ItemFlag.ItemIsDropEnabled
+
+    editor.close()
+    app.processEvents()
+
+
+def test_menu_editor_refuses_to_nest_one_submenu_inside_another():
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication
+
+    from pet.modern_settings_dialog import MenuLayoutEditor
+
+    app = QApplication.instance() or QApplication([])
+    editor = MenuLayoutEditor(None)
+    root = editor.tree.invisibleRootItem()
+    source = next(
+        root.child(index)
+        for index in range(root.childCount())
+        if (root.child(index).data(0, Qt.ItemDataRole.UserRole) or {}).get("id") == "pet_controls"
+    )
+    editor.tree.setCurrentItem(source)
+    editor.move_menu.aboutToShow.emit()
+    next(action for action in editor.move_menu.actions() if action.data() == "tools_help").trigger()
+
+    assert source.parent() is None
+    editor.close()
+    app.processEvents()
+
+
+def test_removed_action_is_ignored_with_migration_diagnostic():
+    result = resolve_menu_layout(
+        {
+            "schema_version": 1,
+            "layout_id": "user",
+            "nodes": [
+                {"type": "action", "id": "retired_action", "visible": True},
+                {"type": "action", "id": "chat", "visible": True},
+                {"type": "action", "id": "modern_settings", "visible": True},
+                {"type": "action", "id": "quit", "visible": True},
+            ],
+        },
+        registered_actions={"chat", "modern_settings", "quit"},
+        available_actions={"chat", "modern_settings", "quit"},
+    )
+
+    assert result.source == "normalized"
+    assert result.diagnostics == ("unknown-action:retired_action",)
+    assert [node["id"] for node in result.nodes] == ["chat", "modern_settings", "quit"]
+
+
+def test_user_layout_gains_future_default_action_without_losing_custom_order(
+    monkeypatch,
+):
+    import pet.menu_layout as layout_mod
+
+    monkeypatch.setattr(
+        layout_mod,
+        "load_default_menu_layout",
+        lambda: {
+            "schema_version": 1,
+            "layout_id": "modern-default-v1",
+            "nodes": [
+                {
+                    "type": "submenu",
+                    "id": "pet_controls",
+                    "label": "桌宠控制",
+                    "visible": True,
+                    "children": [
+                        {"type": "action", "id": "drag_physics", "visible": True},
+                        {"type": "action", "id": "future_action", "visible": True},
+                        {"type": "action", "id": "no_move", "visible": True},
+                    ],
+                },
+                {"type": "action", "id": "modern_settings", "visible": True},
+                {"type": "action", "id": "quit", "visible": True},
+            ],
+        },
+    )
+    result = resolve_menu_layout(
+        {
+            "schema_version": 1,
+            "layout_id": "user",
+            "nodes": [
+                {
+                    "type": "submenu",
+                    "id": "pet_controls",
+                    "label": "我的桌宠操作",
+                    "visible": True,
+                    "children": [
+                        {"type": "action", "id": "no_move", "visible": True},
+                        {"type": "action", "id": "drag_physics", "visible": False},
+                    ],
+                },
+                {"type": "action", "id": "modern_settings", "visible": True},
+                {"type": "action", "id": "quit", "visible": True},
+            ],
+        },
+        registered_actions={
+            "drag_physics",
+            "future_action",
+            "no_move",
+            "modern_settings",
+            "quit",
+        },
+        available_actions={
+            "drag_physics",
+            "future_action",
+            "no_move",
+            "modern_settings",
+            "quit",
+        },
+    )
+
+    assert result.source == "normalized"
+    assert result.diagnostics == ("default-action-added:future_action",)
+    controls = result.nodes[0]
+    assert controls["label"] == "我的桌宠操作"
+    assert [child["id"] for child in controls["children"]] == [
+        "no_move",
+        "future_action",
+    ]
+
+
+def test_menu_editor_exposes_future_default_action_for_customization(monkeypatch):
+    from PySide6.QtWidgets import QApplication
+
+    import pet.menu_layout as layout_mod
+    from pet.modern_settings_dialog import MenuLayoutEditor
+
+    monkeypatch.setattr(
+        layout_mod,
+        "load_default_menu_layout",
+        lambda: {
+            "schema_version": 1,
+            "layout_id": "modern-default-v1",
+            "nodes": [
+                {"type": "action", "id": "chat", "visible": True},
+                {"type": "action", "id": "look_screen", "visible": True},
+                {"type": "action", "id": "modern_settings", "visible": True},
+                {"type": "action", "id": "quit", "visible": True},
+            ],
+        },
+    )
+    app = QApplication.instance() or QApplication([])
+    editor = MenuLayoutEditor(
+        {
+            "schema_version": 1,
+            "layout_id": "user",
+            "nodes": [
+                {"type": "action", "id": "chat", "visible": True},
+                {"type": "action", "id": "modern_settings", "visible": True},
+                {"type": "action", "id": "quit", "visible": True},
+            ],
+        },
+        available_actions={"chat", "look_screen", "modern_settings", "quit"},
+    )
+
+    assert editor.item_for_action("look_screen") is not None
+    assert [node["id"] for node in editor.value()["nodes"]] == [
+        "chat",
+        "look_screen",
+        "modern_settings",
+        "quit",
+    ]
+    editor.close()
+    app.processEvents()
+
+
+def test_settings_rejects_invalid_nested_menu_draft_before_writing(tmp_path, monkeypatch):
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication, QTreeWidgetItem
+
+    from pet import modern_settings_dialog as settings_mod
+    from pet import settings_close_flow
+    from pet.config import Config
+    from pet.modern_settings_dialog import ModernSettingsDialog
+
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(settings_mod.autostart_mod, "is_enabled", lambda: False)
+    # 提示形态自 2026-10-10 起统一由关闭闸门给（pet/settings_close_flow）：判据从
+    # QMessageBox.warning 换成**产品真实构造**的失败框里那段话（布局诊断必须出现在
+    # 用户看到的那一段里），出口仍是"继续编辑"与「放弃未保存的改动并关闭」。
+    notices: list = []
+
+    def answer(parent, failure):
+        box, _keep, _discard = settings_close_flow.build_save_failure_box(parent, failure)
+        try:
+            notices.append(box.text())
+        finally:
+            box.deleteLater()
+        return False
+
+    monkeypatch.setattr(settings_close_flow, "confirm_discard_unsaved", answer)
+    dialog = ModernSettingsDialog(Config(tmp_path), include_ai=False)
+    outer = next(
+        dialog.menu_layout_editor.tree.topLevelItem(i)
+        for i in range(dialog.menu_layout_editor.tree.topLevelItemCount())
+        if (dialog.menu_layout_editor.tree.topLevelItem(i).data(0, Qt.ItemDataRole.UserRole) or {}).get("id") == "pet_controls"
+    )
+    nested = QTreeWidgetItem(["非法内层", ""])
+    nested.setData(0, Qt.ItemDataRole.UserRole, {"type": "submenu", "id": "user.invalid", "section": None})
+    nested.setCheckState(0, Qt.CheckState.Checked)
+    outer.addChild(nested)
+
+    dialog._save()
+
+    assert dialog.result() == 0
+    assert Config(tmp_path).get("context_menu_layout") is None
+    assert notices and "菜单布局" in notices[0]
+    dialog.reject()
+    app.processEvents()
+# --- Settings menu customization regressions (2026-09-03) ---
+
+
+def test_settings_action_popups_share_the_modern_select_visual_tokens():
+    from PySide6.QtWidgets import QApplication
+
+    from pet.context_menus.registry import MENU_ACTIONS
+    from pet.modern_settings_dialog import MenuLayoutEditor, QuickLaunchEditor
+
+    app = QApplication.instance() or QApplication([])
+    editor = MenuLayoutEditor(None, available_actions=MENU_ACTIONS.ids)
+    launcher = QuickLaunchEditor([])
+    menus = [
+        editor.order_menu, editor.move_menu, editor.submenu_menu,
+        editor.customize_menu, editor.more_menu, launcher.add_menu,
+    ]
+    assert all(menu.objectName() == "SettingsPopup" for menu in menus)
+    assert all("border-radius: 10px" in menu.styleSheet() for menu in menus)
+    assert all("padding: 6px" in menu.styleSheet() for menu in menus)
+    assert all("min-height: 22px" in menu.styleSheet() for menu in menus)
+    editor.close()
+    launcher.close()
+    app.processEvents()
+
+
+def test_action_popups_use_the_exact_same_popup_surface_as_menu_mode():
+    from PySide6.QtWidgets import QApplication
+
+    from pet.context_menus.registry import MENU_ACTIONS
+    from pet.modern_settings_dialog import MenuLayoutEditor, ModernSelect, QuickLaunchEditor
+
+    app = QApplication.instance() or QApplication([])
+    select = ModernSelect(width=156)
+    select.addItem("新版菜单", "modern")
+    select.addItem("旧版兼容菜单", "legacy")
+    select.show()
+    select.showPopup()
+    app.processEvents()
+    editor = MenuLayoutEditor(None, available_actions=MENU_ACTIONS.ids)
+    launcher = QuickLaunchEditor([])
+
+    reference = select._popup
+    assert reference is not None
+    for popup in (editor.order_menu, editor.customize_menu, launcher.add_menu):
+        assert popup.objectName() == reference.objectName()
+        assert popup.styleSheet() == reference.styleSheet()
+        assert popup.property("settingsPopup") is True
+
+    reference.close()
+    select.close()
+    editor.close()
+    launcher.close()
+    app.processEvents()
+
+
+def test_menu_editor_header_columns_are_user_resizable():
+    from PySide6.QtWidgets import QApplication, QHeaderView
+
+    from pet.modern_settings_dialog import MenuLayoutEditor
+
+    app = QApplication.instance() or QApplication([])
+    editor = MenuLayoutEditor(None)
+    editor.resize(1000, 560)
+    editor.show()
+    app.processEvents()
+
+    header = editor.tree.header()
+    assert all(
+        header.sectionResizeMode(index) == QHeaderView.ResizeMode.Interactive
+        for index in range(3)
+    )
+    assert not header.sectionsMovable()
+    original = editor.tree.columnWidth(0)
+    header.resizeSection(0, original + 48)
+    app.processEvents()
+    assert editor.tree.columnWidth(0) == original + 48
+    assert "拖动表头" in editor.editor_hint.text()
+    editor.close()
+    app.processEvents()
+
+
+def test_settings_tabs_are_compact_left_aligned_plugin_style_navigation():
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication, QSizePolicy, QWidget
+
+    from pet.modern_settings_dialog import SettingsTabContainer
+
+    app = QApplication.instance() or QApplication([])
+    tabs = SettingsTabContainer()
+    for key, label in (("layout", "菜单编排"), ("launcher", "快捷启动"), ("appearance", "外观")):
+        tabs.addTab(key, label, QWidget())
+    tabs.resize(900, 420)
+    tabs.show()
+    app.processEvents()
+
+    assert tabs.tab_bar.sizePolicy().horizontalPolicy() == QSizePolicy.Policy.Maximum
+    assert tabs.tab_layout.alignment() & Qt.AlignmentFlag.AlignLeft
+    assert tabs.tab_bar.width() < tabs.width() * 0.7
+    assert all(button.property("navigationStyle") == "plugin" for button in tabs._buttons)
+    tabs.close()
+    app.processEvents()
+
+
+def test_action_menu_button_matches_selector_popup_geometry_and_anchor():
+    from PySide6.QtCore import QPoint
+    from PySide6.QtWidgets import QApplication, QWidgetAction
+
+    from pet.modern_settings_dialog import MenuLayoutEditor, ModernSelect, SettingsMenuButton
+
+    app = QApplication.instance() or QApplication([])
+    select = ModernSelect(width=240)
+    select.addItem("新版菜单", "modern")
+    select.addItem("旧版兼容菜单", "legacy")
+    select.move(40, 40)
+    select.show()
+    select.showPopup()
+    app.processEvents()
+    selector_popup = select._popup
+    assert selector_popup is not None
+
+    editor = MenuLayoutEditor(None)
+    editor.resize(1000, 560)
+    editor.show()
+    app.processEvents()
+    button = editor.order_button
+    assert isinstance(button, SettingsMenuButton)
+    assert button.menu() is None  # no native indicator/anchoring path
+    button.showPopup()
+    app.processEvents()
+    popup = button.popupMenu()
+
+    assert popup.width() >= button.width()
+    assert popup.pos() == button.mapToGlobal(QPoint(0, button.height() + 4))
+    assert popup.property("settingsPopup") == selector_popup.property("settingsPopup")
+    assert not any(isinstance(action, QWidgetAction) for action in selector_popup.actions())
+    assert popup.actionGeometry(popup.actions()[0]).height() == selector_popup.actionGeometry(
+        selector_popup.actions()[0]
+    ).height()
+    popup.close()
+    selector_popup.close()
+    editor.close()
+    select.close()
+    app.processEvents()
+
+
+def test_menu_editor_uses_three_responsive_toolbar_and_panel_modes():
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication
+
+    from pet.modern_settings_dialog import MenuLayoutEditor
+
+    app = QApplication.instance() or QApplication([])
+    editor = MenuLayoutEditor(None)
+    editor.show()
+
+    editor.resize(1000, 600)
+    app.processEvents()
+    assert editor.property("layoutMode") == "wide"
+    assert editor.split.orientation() == Qt.Orientation.Horizontal
+    assert max(button.width() for button in editor.toolbar_buttons) <= 132
+    assert editor.toolbar_layout.itemAtPosition(0, 4) is not None
+
+    editor.resize(680, 700)
+    app.processEvents()
+    assert editor.property("layoutMode") == "medium"
+    assert editor.split.orientation() == Qt.Orientation.Vertical
+    assert editor.toolbar_layout.itemAtPosition(1, 1) is not None
+    assert editor.toolbar_layout.itemAtPosition(1, 2) is None
+
+    editor.resize(430, 760)
+    app.processEvents()
+    assert editor.property("layoutMode") == "compact"
+    assert editor.tree.isColumnHidden(2)
+    assert editor.toolbar_layout.itemAtPosition(2, 0) is not None
+    assert editor.editor_hint.isHidden()
+    editor.close()
+    app.processEvents()
+
+
+def test_alias_keeps_original_name_in_editor_but_runtime_uses_alias_only():
+    from PySide6.QtWidgets import QApplication, QMenu
+
+    from pet.context_menus.registry import MENU_ACTIONS
+    from pet.modern_settings_dialog import MenuLayoutEditor
+
+    class Pet:
+        on_open_chat = lambda self: None
+
+    app = QApplication.instance() or QApplication([])
+    editor = MenuLayoutEditor(None, available_actions=MENU_ACTIONS.ids)
+    editor.resize(900, 520)
+    editor.show()
+    app.processEvents()
+    editor.set_item_alias("chat", "和鲸鱼聊聊")
+    item = editor.item_for_action("chat")
+    assert item.text(0) == "和鲸鱼聊聊（AI 对话）"
+    assert editor.tree.header().sectionSize(0) > editor.tree.header().sectionSize(2)
+    preview = [
+        editor.preview.topLevelItem(index).text(0)
+        for index in range(editor.preview.topLevelItemCount())
+    ]
+    assert "和鲸鱼聊聊" in preview
+    assert item.text(0) not in preview
+    menu = QMenu()
+    MENU_ACTIONS.populate(menu, Pet(), ({
+        "type": "action", "id": "chat", "alias": "和鲸鱼聊聊",
+    },), enabled_actions={"chat"})
+    assert [action.text() for action in menu.actions()] == ["和鲸鱼聊聊"]
+    editor.close()
+    menu.close()
+    app.processEvents()
+
+
+def test_custom_file_icon_is_validated_persisted_and_supports_fit_modes(tmp_path):
+    from PIL import Image
+    from PySide6.QtWidgets import QApplication, QMenu
+
+    from pet.context_menus.icons import custom_file_menu_icon
+    from pet.context_menus.registry import MENU_ACTIONS
+    from pet.menu_layout import resolve_menu_layout
+    from pet.modern_settings_dialog import MenuLayoutEditor, custom_icon_file_error
+
+    icon_path = tmp_path / "wide icon.png"
+    Image.new("RGBA", (80, 32), (20, 120, 220, 255)).save(icon_path)
+    invalid_path = tmp_path / "not-image.txt"
+    invalid_path.write_text("not an image", encoding="utf-8")
+    app = QApplication.instance() or QApplication([])
+    editor = MenuLayoutEditor(None, available_actions=MENU_ACTIONS.ids)
+    assert custom_icon_file_error(icon_path) == ""
+    assert custom_icon_file_error(invalid_path)
+    assert editor.set_item_file_icon("chat", icon_path, "contain") is True
+    chat = next(node for node in editor.value()["nodes"] if node.get("id") == "chat")
+    assert chat["icon"] == {
+        "kind": "file", "path": str(icon_path.resolve()), "display": "contain",
+    }
+    assert not editor.item_for_action("chat").icon(0).isNull()
+    resolved = resolve_menu_layout(
+        editor.value(),
+        registered_actions=MENU_ACTIONS.ids,
+        available_actions=MENU_ACTIONS.ids,
+    )
+    resolved_chat = next(node for node in resolved.nodes if node.get("id") == "chat")
+    assert resolved_chat["icon"] == chat["icon"]
+    menu = QMenu()
+    MENU_ACTIONS.populate(menu, type("Pet", (), {"on_open_chat": lambda self: None})(),
+                          (resolved_chat,), enabled_actions={"chat"})
+    assert not menu.actions()[0].icon().isNull()
+    contain = custom_file_menu_icon(menu, chat["icon"], 18).pixmap(18, 18).toImage()
+    assert contain.pixelColor(9, 0).alpha() == 0
+    assert editor.set_item_file_icon("chat", icon_path, "cover") is True
+    chat = next(node for node in editor.value()["nodes"] if node.get("id") == "chat")
+    assert chat["icon"]["display"] == "cover"
+    cover = custom_file_menu_icon(menu, chat["icon"], 18).pixmap(18, 18).toImage()
+    assert cover.pixelColor(9, 0).alpha() > 0
+    assert {action.text() for action in editor.icon_display_menu.actions()} == {
+        "完整显示", "裁切填满",
+    }
+    editor.close()
+    menu.close()
+    app.processEvents()
+
+
+def test_pending_preview_refresh_is_cancelled_when_editor_destroyed():
+    """回归：编辑器 C++ 对象销毁后，遗留的预览刷新不得再触碰已销毁的子控件。
+
+    原实现用静态 ``QTimer.singleShot(0, self._flush_preview_refresh)``：它无法
+    取消、也不随编辑器一起销毁；窗口关闭（C++ 对象已删除）后回调仍会执行
+    ``_on_changed``，并在 ``self.tree.blockSignals(True)`` 抛
+    ``RuntimeError: Internal C++ object (QTreeWidget) already deleted``。
+    全量套件里这个残留回调由后续无关测试的 ``processEvents()`` 引爆
+    （test_agent_link_threads / test_webm_clip_broker_feed 观测到）。
+
+    owner 侧修法：改成父对象为自身的成员单次 timer（随对象销毁）+ 有效性闸门。
+    """
+    import shiboken6
+    from PySide6.QtWidgets import QApplication
+
+    from pet.modern_settings_dialog import MenuLayoutEditor
+
+    app = QApplication.instance() or QApplication([])
+    editor = MenuLayoutEditor(None)
+    editor._schedule_preview_refresh()
+    assert editor._preview_refresh_pending is True
+    shiboken6.delete(editor)  # 同步销毁：等价于窗口关闭后 C++ 对象消失
+    app.processEvents()  # 不得抛 RuntimeError（旧实现此处必红）
+
+
+def test_music_align_ready_and_callback_routing(monkeypatch):
+    """「歌词对齐」的可用性判定与回调路由。
+
+    实测依据（2026-09-21）：网易云音乐不上报播放进度 → 位置只能本地估算 →
+    快进后必须手动对齐；而报了进度的播放器（Chrome / QQ 音乐）位置本来就跟着
+    走，此时必须置灰（否则手动对齐会与真值打架）。
+    """
+    from PySide6.QtCore import QObject
+    from PySide6.QtWidgets import QApplication
+
+    from pet.context_menus import registry as registry_mod
+    from pet.context_menus import shared as shared_mod
+    from pet.music.lyric import LyricLine
+    from pet.music.lyric_controller import MusicLyricController
+
+    app = QApplication.instance() or QApplication([])
+
+    class Win(QObject):
+        _alert_current = None
+        _sticky_bubble_active = False
+        _speech_bubble = None
+
+        def isVisible(self):
+            return True
+
+        def show_bubble(self, *args, **kwargs):
+            return None
+
+        def hold_bubble(self, *args, **kwargs):
+            return None
+
+    class Cfg:
+        def get(self, key, default=None):
+            return default
+
+    class Pet:
+        cfg = Cfg()
+
+    ctrl = MusicLyricController(Win())
+    ctrl._tracker.load(
+        [LyricLine(0.0, "A"), LyricLine(5.0, "B")], now=0.0, position=None,
+    )
+    pet = Pet()
+    pet._music_lyric = ctrl
+    assert registry_mod._music_align_ready(pet) is True     # 本地时钟 + 有词
+
+    # 报进度的播放器：位置本就跟着快进走，不该提供手动对齐
+    ctrl._tracker.position(0.0, reported=1.0)
+    assert registry_mod._music_align_ready(pet) is False
+
+    # 宿主 __getattr__ 兜底返回可调用对象时，不能把它当成控制器
+    class Loose:
+        cfg = Cfg()
+
+        def __getattr__(self, name):
+            return lambda *args, **kwargs: None
+
+    assert registry_mod._music_align_ready(Loose()) is False
+
+    # 五个手柄各自路由到控制器对应方法
+    calls: list = []
+    monkeypatch.setattr(ctrl, "resync_to_start", lambda: calls.append("start") or True)
+    monkeypatch.setattr(
+        ctrl, "resync_to_line", lambda d: calls.append(("line", d)) or True,
+    )
+    monkeypatch.setattr(ctrl, "nudge", lambda s: calls.append(("nudge", s)) or True)
+
+    for kind in ("start", "prev", "next", "back5", "fwd5"):
+        assert shared_mod._align_lyric(pet, kind) is True
+    assert calls == [
+        "start", ("line", -1), ("line", 1), ("nudge", -5.0), ("nudge", 5.0),
+    ]
+    assert shared_mod._align_lyric(pet, "不存在的动作") is False
+    ctrl.shutdown()
+    app.processEvents()
+
+
+def _stylesheet_font_family(sheet: str) -> str:
+    for line in sheet.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("font-family:"):
+            return stripped[len("font-family:"):].rstrip(";").strip()
+    raise AssertionError("modern 菜单样式表里没有 font-family")
+
+
+def test_system_font_stack_matches_platform():
+    """右键菜单 font-family 必须是**单族**，且该族要覆盖菜单里的中文。
+
+    2026-09-28 真 Qt(Windows 6.11) 分步实测：`QFontDatabase` 的族枚举本身只要 ~16MB，
+    但只要拿一个「请求族覆盖不了待测文本」或「多族列表」的 QFont 去测量中文文本，
+    Qt 就会为缺失字形做回退搜索而枚举整个字体库，把 C:\\Windows\\Fonts 的 528 个字体
+    文件（~831MB）映射进进程——菜单弹出一次后 msyh.ttc 37.6MB、StaticCache.dat 19.2MB、
+    simhei/arial 等常驻，RSS +70~150MB 不回。旧 macOS 栈、新 Windows 三族栈、
+    单族但不存在（或覆盖不了中文）三种写法都会触发，所以这里只允许单族。
+    """
+    import sys
+    from pet.context_menus.menu_styles.common import SYSTEM_FONT_STACK
+    from pet.context_menus.menu_styles.modern import modern_menu_stylesheet
+
+    sheet = modern_menu_stylesheet({"theme": "light"})
+    assert SYSTEM_FONT_STACK in sheet
+    family = _stylesheet_font_family(sheet)
+    if sys.platform == "win32":
+        # 单族 + 覆盖中文，两个条件缺一都会触发枚举（实测）
+        assert "," not in family, f"多族 font-family 会触发全字体库枚举: {family}"
+        assert "Microsoft YaHei" in family
+    elif sys.platform == "darwin":
+        # macOS 未实机验证，多族栈按原样保留，这里只锁住「没被顺手改掉」
+        assert "SF Pro Text" in family
+
+    # 用户自选字体也必须收敛成单族，否则挑了自定义字体的人重新踩同一个坑
+    custom = _stylesheet_font_family(
+        modern_menu_stylesheet({"theme": "light", "ui_font": "Consolas"})
+    )
+    assert "," not in custom, f"自选字体被拼成多族: {custom}"
+    assert "Consolas" in custom
+
+
+def test_screen_capture_menu_entry_keeps_shared_vector_icon():
+    """「截图提问」菜单项继续用 shared 矢量图标，不挂任何位图品牌素材。"""
+    from PySide6.QtWidgets import QApplication, QMenu
+
+    QApplication.instance() or QApplication([])
+
+    from pet.context_menus.icons import vector_menu_icon
+    from pet.context_menus.shared import add_screen_capture_menu
+
+    class _Pet:
+        def on_screen_capture(self):
+            pass
+
+    menu = QMenu()
+    action = add_screen_capture_menu(menu, _Pet())
+    assert action is not None
+    assert action.icon().pixmap(16, 16).toImage() == vector_menu_icon(menu, "size").pixmap(16, 16).toImage()
+    menu.deleteLater()
+
+    bare = QMenu()
+    assert add_screen_capture_menu(bare, _Pet(), icons=False).icon().isNull()
+    bare.deleteLater()
+
+
+# --------------------------------------------------- 音乐：四播放器启动入口
+# 2026-10-16：原先菜单里只有「打开网易云 / QQ音乐并播放」两个入口，酷狗与汽水
+# 缺失（用户点名的缺口）。四个入口必须**同源**：同一个 ``_music_player_builder``
+# 建造器 + 同一个 ``_launch_player_and_play`` worker，只有 player_key 不同；
+# 因此路径解析、冷缓存乐观启用、后台预热、负缓存置灰、手填路径失效提示这几条语义
+# 由共享代码一次性给出，新键不该各写一遍。
+
+_PLAYER_KEYS = ("netease", "qqmusic", "kugou", "soda")
+
+
+def _player_entry_labels() -> dict[str, str]:
+    """播放器键 → 菜单项文案（文案取自 ``music_players`` 注册表的显示名）。"""
+    from pet.music import players as music_players
+
+    return {
+        key: f"打开{music_players.player_label(key)}给主人放歌"
+        for key in _PLAYER_KEYS
+    }
+
+
+def _full_menu_pet(values=None):
+    """构建整棵真实菜单用的最小宿主替身（口径同 test_default_layout_...）。"""
+    from PySide6.QtGui import QPixmap
+
+    class _Cfg:
+        def __init__(self, seed):
+            self.values = dict(seed)
+
+        def get(self, key, default=None):
+            return self.values.get(key, default)
+
+        def set(self, key, value):
+            self.values[key] = value
+
+        def save(self):
+            return None
+
+    class _Pet:
+        cfg = _Cfg({
+            "context_menu_layout": None,
+            "character": "shenshen",
+            "on_top": True,
+            "agent_link": {},
+            "music_lyric_enabled": True,
+            **(values or {}),
+        })
+        idles = ["待机"]
+        turns = moves = clicks = acts = []
+        playback_speed = scale = 1.0
+        drag_physics = no_move = mouse_through = False
+
+        def icon_pixmap(self, size=64):
+            pixmap = QPixmap(size, size)
+            pixmap.fill()
+            return pixmap
+
+        def __getattr__(self, _name):
+            return lambda *args, **kwargs: None
+
+    return _Pet()
+
+
+def _build_full_menu(monkeypatch, pet):
+    """按默认布局建一棵真实菜单（窗口侧与 overlay 侧共用这一条路径）。"""
+    from PySide6.QtWidgets import QApplication, QMenu
+
+    from pet import catalog
+    from pet.context_menu import populate_context_menu
+    from pet.context_menus import shared
+
+    monkeypatch.setattr(shared.autostart_mod, "is_enabled", lambda: False)
+    monkeypatch.setattr(catalog, "list_available_characters", lambda: ["shenshen"])
+    QApplication.instance() or QApplication([])
+    menu = QMenu()
+    populate_context_menu(menu, pet)
+    return menu
+
+
+def _music_entries(menu) -> dict:
+    """音乐子菜单：文案 → QAction。"""
+    submenu = next(a.menu() for a in menu.actions() if a.text() == "音乐")
+    return {a.text(): a for a in submenu.actions() if not a.isSeparator()}
+
+
+def _wait_until(predicate, *, timeout: float = 15.0) -> bool:
+    """轮询等待（事件同步 + 宽预算，不赌固定 sleep 时序）。"""
+    import time
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return bool(predicate())
+
+
+def _save_player_cache():
+    from pet.music import players as music_players
+
+    saved = dict(music_players._cache)
+    with music_players._warm_lock:
+        inflight = set(music_players._warm_inflight)
+    music_players.clear_cache()
+    return saved, inflight
+
+
+def _restore_player_cache(saved) -> None:
+    from pet.music import players as music_players
+
+    cache, inflight = saved
+    music_players.clear_cache()
+    music_players._cache.update(cache)
+    with music_players._warm_lock:
+        music_players._warm_inflight.clear()
+        music_players._warm_inflight.update(inflight)
+
+
+def test_music_submenu_registers_and_places_every_known_player():
+    """四播放器各有一个「打开…并播放」入口，且模板与注册表同时到位。
+
+    两头缺一都不行：**模板**决定默认树形状（老用户布局由
+    ``_merge_future_default_actions`` 按模板锚点补进同一位置），**注册表**决定 id
+    能不能渲染——只补注册表就是"老用户永远看不到"，只补模板则节点被当
+    unknown-action 丢掉（旧版扁平菜单绕开注册表的历史形态）。
+    """
+    from pet.music import players as music_players
+    from pet.context_menus.registry import ACTION_ICONS, ACTION_LABELS, MENU_ACTIONS
+
+    # 注册表里登记过的播放器都必须有菜单入口：后端再加播放器时不会漏掉菜单一侧。
+    assert {
+        f"music_open_{key}" for key in music_players.PLAYERS
+    } <= MENU_ACTIONS.ids
+
+    for key in _PLAYER_KEYS:
+        action_id = f"music_open_{key}"
+        assert action_id in MENU_ACTIONS.ids, f"注册表缺 {action_id}"
+        assert ACTION_LABELS.get(action_id), (
+            f"{action_id} 没有规范文案：菜单编辑器里会退化成裸 id")
+        assert ACTION_ICONS.get(action_id) == "play"
+
+    layout = load_default_menu_layout("modern-default-v1")
+    music = next(node for node in layout["nodes"] if node.get("id") == "music")
+    assert [node["id"] for node in music["children"]] == [
+        "music_pause",
+        "music_next",
+        "music_prev",
+        "music_quit",
+        "music_lyric_align",
+        "music.separator-launch",
+        "music_open_netease",
+        "music_open_qqmusic",
+        "music_open_kugou",
+        "music_open_soda",
+    ]
+
+
+def test_new_player_entries_click_routes_its_own_key_through_the_shared_worker(monkeypatch):
+    """酷狗 / 汽水入口各自把**自己的**键交给共用的启动 worker。
+
+    这是"复制一份建造器"最容易犯的错：key 抄错（点酷狗起的是汽水）。这里走完整
+    点击路径（注册表建的菜单项 → action.trigger() → worker），核对 worker 收到的
+    播放器键与传给系统媒体控制的 exe basename。
+    """
+    from PySide6.QtWidgets import QApplication
+
+    from pet.music import players as music_players, now_playing
+    from pet.context_menus import shared
+
+    monkeypatch.setattr(music_players, "warm_cache_async", lambda key, manual="": True)
+    monkeypatch.setattr(
+        music_players, "cached_player",
+        lambda key, manual="": (music_players.CACHED_FOUND, f"D:/players/{key}.exe"),
+    )
+    resolved: list[str] = []
+    played: list[str] = []
+    monkeypatch.setattr(
+        music_players, "find_player",
+        lambda key, manual="": (resolved.append(key), f"D:/players/{key}.exe")[1],
+    )
+    monkeypatch.setattr(
+        now_playing, "play_session_for",
+        lambda exe_name: (played.append(exe_name), True)[1],
+    )
+
+    app = QApplication.instance() or QApplication([])
+    entries = _music_entries(_build_full_menu(monkeypatch, _full_menu_pet()))
+    labels = _player_entry_labels()
+    try:
+        for key in ("kugou", "soda"):
+            action = entries[labels[key]]
+            assert action.isEnabled() is True, f"{key} 入口应可用：{action.toolTip()}"
+            resolved.clear()
+            played.clear()
+            action.trigger()
+            assert _wait_until(lambda: played == [f"{key}.exe"]), (
+                f"{key} 入口没走通共用 worker：resolved={resolved} played={played}")
+            assert resolved == [key], f"{key} 入口解析了别的播放器键：{resolved}"
+        # 收口：worker 收工信号是 queued 的，处理事件让信号桥自己出队，
+        # 不把排队事件/残留对象留给后续用例。
+        _wait_until(lambda: not shared._LAUNCH_BRIDGES)
+    finally:
+        for _ in range(20):
+            app.processEvents()
+
+
+def test_new_player_entry_labels_follow_the_player_registry(monkeypatch):
+    """新入口文案取自播放器注册表的显示名，不另抄一份标签。
+
+    注入受控注册表（而不是依赖本机装了哪个播放器）：四个入口的文案一一对应各自的
+    key，抄错 key 或写死显示名都会红。
+    """
+    from pet.music import players as music_players
+
+    controlled = dict(music_players.PLAYERS)
+    controlled["kugou"] = ("酷狗音乐", "KuGou.exe", ("KuGou",))
+    controlled["soda"] = ("汽水音乐", "SodaMusic.exe", ("Soda Music",))
+    monkeypatch.setattr(music_players, "PLAYERS", controlled)
+    monkeypatch.setattr(music_players, "warm_cache_async", lambda key, manual="": True)
+    saved = _save_player_cache()
+    try:
+        entries = _music_entries(_build_full_menu(monkeypatch, _full_menu_pet()))
+    finally:
+        _restore_player_cache(saved)
+
+    for key in _PLAYER_KEYS:
+        expected = f"打开{music_players.player_label(key)}给主人放歌"
+        assert expected in entries, f"{key} 的入口缺失或文案错位：{sorted(entries)}"
+
+
+def test_cold_cache_keeps_all_four_entries_optimistic_and_warms_each_once(monkeypatch):
+    """冷缓存：四个入口乐观启用（不置灰），并各自幂等触发一次后台预热。"""
+    from pet.music import players as music_players
+
+    saved = _save_player_cache()
+    warms: list[str] = []
+    monkeypatch.setattr(
+        music_players, "warm_cache_async",
+        lambda key, manual="": (warms.append(key), True)[1],
+    )
+    try:
+        entries = _music_entries(_build_full_menu(monkeypatch, _full_menu_pet()))
+    finally:
+        _restore_player_cache(saved)
+
+    for key, label in _player_entry_labels().items():
+        action = entries[label]
+        assert action.isEnabled() is True, f"冷缓存应乐观启用：{label}"
+        assert "找不到" not in action.toolTip(), (
+            f"冷缓存不等于「找不到」，不该挂禁用理由：{action.toolTip()}")
+    assert warms == list(_PLAYER_KEYS), "冷缓存下每个播放器各触发一次幂等预热"
+
+
+def test_inflight_warm_keeps_entry_enabled_and_stays_idempotent(monkeypatch):
+    """预热在途：入口保持乐观启用，且再次开菜单不会重复起一条扫描。"""
+    from pet.music import players as music_players
+
+    saved = _save_player_cache()
+    real_warm = music_players.warm_cache_async
+    with music_players._warm_lock:
+        music_players._warm_inflight.add("kugou")
+    # 在飞期间真实现必须直接返回 False（幂等）——测试里也不能真起扫描线程。
+    assert real_warm("kugou") is False, "在飞期间必须幂等"
+    warms: list[str] = []
+    monkeypatch.setattr(
+        music_players, "warm_cache_async",
+        lambda key, manual="": (warms.append(key), True)[1],
+    )
+    try:
+        entries = _music_entries(_build_full_menu(monkeypatch, _full_menu_pet()))
+        label = _player_entry_labels()["kugou"]
+        assert entries[label].isEnabled() is True, "在途预热不该把入口置灰"
+        # 菜单侧照旧按冷缓存处理（发起幂等预热）；去重是预热层的职责。
+        assert "kugou" in warms
+    finally:
+        _restore_player_cache(saved)
+
+
+def test_negative_cache_greys_the_new_entry_with_settings_hint(monkeypatch):
+    """负缓存命中（扫过、本机没有）：置灰 + 保留说明，且不再重扫。"""
+    from pet.music import players as music_players
+
+    saved = _save_player_cache()
+    music_players._cache["kugou"] = None
+    warms: list[str] = []
+    monkeypatch.setattr(
+        music_players, "warm_cache_async",
+        lambda key, manual="": (warms.append(key), True)[1],
+    )
+    try:
+        entries = _music_entries(_build_full_menu(monkeypatch, _full_menu_pet()))
+    finally:
+        _restore_player_cache(saved)
+
+    label = _player_entry_labels()["kugou"]
+    action = entries[label]
+    assert action.isEnabled() is False
+    assert f"找不到{music_players.player_label('kugou')}" in action.toolTip()
+    assert "设置 → 桌宠 → 音乐关联" in action.toolTip()
+    assert "kugou" not in warms, "负缓存命中不该再预热"
+
+
+def test_manual_player_path_is_authoritative_for_the_new_entry(tmp_path, monkeypatch):
+    """手填路径就是权威：命中启用；文件不存在时置灰并指向设置页（不静默回退）。"""
+    from pet.music import players as music_players
+
+    exe = tmp_path / "KuGou.exe"
+    exe.write_bytes(b"")
+    monkeypatch.setattr(music_players, "warm_cache_async", lambda key, manual="": False)
+    label = _player_entry_labels()["kugou"]
+
+    found = _music_entries(_build_full_menu(
+        monkeypatch, _full_menu_pet({"music_player_paths": {"kugou": str(exe)}})))
+    assert found[label].isEnabled() is True
+
+    missing = _music_entries(_build_full_menu(
+        monkeypatch,
+        _full_menu_pet({"music_player_paths": {"kugou": str(tmp_path / "nope.exe")}}),
+    ))
+    assert missing[label].isEnabled() is False
+    assert "设置 → 桌宠 → 音乐关联" in missing[label].toolTip(), (
+        "手填路径失效必须给出可见反馈，不能静默回退自动搜索")
+
+
+def test_saved_user_layout_gains_the_new_player_entries_beside_their_siblings():
+    """存过布局的老用户也拿得到酷狗 / 汽水：按模板锚点插回音乐子菜单。
+
+    「新默认动作补进老布局」的通用机制另有专测；这里锁的是**本次两个新 id 的落点**：
+    插错父节点（比如掉到根菜单）时老用户会看到两条孤零零的菜单项，而那类错误只有拿
+    真实模板跑一遍才看得见。顺序也要保持——新入口跟同组的两条排在一起。
+    """
+    from pet.context_menus.registry import MENU_ACTIONS
+
+    result = resolve_menu_layout(
+        {
+            "schema_version": 1,
+            "layout_id": "user",
+            "nodes": [
+                {
+                    "type": "submenu",
+                    "id": "music",
+                    "label": "音乐",
+                    "visible": True,
+                    "children": [
+                        {"type": "action", "id": "music_open_netease", "visible": True},
+                        {"type": "action", "id": "music_open_qqmusic", "visible": True},
+                    ],
+                },
+                {"type": "action", "id": "modern_settings", "visible": True},
+                {"type": "action", "id": "quit", "visible": True},
+            ],
+        },
+        registered_actions=MENU_ACTIONS.ids,
+        available_actions=MENU_ACTIONS.ids,
+    )
+
+    music = next(node for node in result.nodes if node.get("id") == "music")
+    # 老布局里缺的默认动作一并按模板锚点补回（这是通用机制）：五个音乐控制在前，
+    # 两个新入口紧跟同组的两条启动项。
+    assert [child["id"] for child in music["children"]] == [
+        "music_pause",
+        "music_next",
+        "music_prev",
+        "music_quit",
+        "music_lyric_align",
+        "music_open_netease",
+        "music_open_qqmusic",
+        "music_open_kugou",
+        "music_open_soda",
+    ]
+    assert "default-action-added:music_open_kugou" in result.diagnostics
+    assert "default-action-added:music_open_soda" in result.diagnostics
+    # 补出来的入口只进音乐子菜单，不会掉到根菜单
+    root_ids = [node.get("id") for node in result.nodes]
+    assert "music" in root_ids
+    assert "music_open_kugou" not in root_ids
+    assert "music_open_soda" not in root_ids

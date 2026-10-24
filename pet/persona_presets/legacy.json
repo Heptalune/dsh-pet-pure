@@ -1,0 +1,152 @@
+{
+  "activity.default": [
+    "{name} 正在当前会话 {sessionName} 中处理 {label}。",
+    "当前会话 {sessionName} 中，{name} 正在使用 {tool} 执行当前操作。",
+    "{name} 在当前会话 {sessionName} 中执行到第 {step} 步，请稍等。"
+  ],
+  "activity.edit": [
+    "{name} 正在当前会话 {sessionName} 中编辑 {label}。",
+    "当前会话 {sessionName} 中，{name} 正在通过 {tool} 修改内容。",
+    "{name} 在当前会话 {sessionName} 中执行到第 {step} 步，编辑仍在进行。"
+  ],
+  "activity.read": [
+    "{name} 正在当前会话 {sessionName} 中读取 {label}。",
+    "当前会话 {sessionName} 中，{name} 正在通过 {tool} 查看相关内容。",
+    "{name} 在当前会话 {sessionName} 中执行到第 {step} 步，正在读取所需信息。"
+  ],
+  "activity.run": [
+    "{name} 正在当前会话 {sessionName} 中运行 {label}。",
+    "当前会话 {sessionName} 中，{name} 已通过 {tool} 开始执行。",
+    "{name} 在当前会话 {sessionName} 中执行到第 {step} 步，任务仍在运行。"
+  ],
+  "activity.search": [
+    "{name} 正在当前会话 {sessionName} 中搜索 {label}。",
+    "当前会话 {sessionName} 中，{name} 正在使用 {tool} 查找相关信息。",
+    "{name} 在当前会话 {sessionName} 中执行到第 {step} 步，搜索仍在进行。"
+  ],
+  "agent.attention": [
+    "{name} 需要你确认一下。",
+    "{name} 已暂停，正在等待你的处理。",
+    "{name} 当前需要人工确认后才能继续。"
+  ],
+  "agent.error": [
+    "{name} 运行时出现了错误，请检查一下。",
+    "{name} 遇到了异常，可能需要你处理。",
+    "{name} 当前处于错误状态，无法正常继续执行。"
+  ],
+  "agent.missing": [
+    "暂时没有检测到 {name}。",
+    "本机当前未检测到 {name}。",
+    "没有发现 {name} 的安装，请检查一下。"
+  ],
+  "approval.generic": [
+    "当前会话 {sessionName} 中，{name} 有一项操作等待你的批准。",
+    "{name} 正在当前会话 {sessionName} 中等待你确认 {label}。",
+    "请确认是否允许当前会话 {sessionName} 中的 {name} 继续执行。"
+  ],
+  "approval.tool": [
+    "当前会话 {sessionName} 中，{name} 请求使用工具 {toolName}。",
+    "请确认是否允许当前会话 {sessionName} 中的 {name} 执行 {label}。",
+    "{name} 正在当前会话 {sessionName} 中等待工具 {toolName} 的使用批准。"
+  ],
+  "balance.loading": [
+    "正在查询余额，请稍等。",
+    "正在获取当前余额信息。",
+    "余额查询中。"
+  ],
+  "balance.result": [
+    "当前余额：{text}",
+    "余额查询完成：{text}",
+    "已获取余额信息：{text}"
+  ],
+  "bridge.install.failed": [
+    "{name} 的通信桥安装失败：{detail}",
+    "连接 {name} 时出现问题：{detail}",
+    "{name} 的桥接组件未能成功安装，请检查：{detail}"
+  ],
+  "bridge.install.pending": [
+    "正在为 {name} 安装通信桥。",
+    "正在连接 {name}，请稍等。",
+    "{name} 的桥接组件正在安装。"
+  ],
+  "bridge.install.success": [
+    "{name} 的通信桥已安装完成。",
+    "{name} 已成功完成桥接。",
+    "{name} 的桥接组件已准备就绪。"
+  ],
+  "bridge.uninstall.failed": [
+    "{name} 的通信桥未能完全卸载。",
+    "{name} 的桥接组件仍有残留，请检查一下。",
+    "{name} 的卸载过程未完全完成。"
+  ],
+  "bridge.unknown": [
+    "检测到未知的桥接事件（{event}），bridge 可能需要更新或重装。",
+    "桥接发来一个我不认识的事件（{event}），请更新或重装 bridge 插件。",
+    "bridge 写出的事件「{event}」超出当前版本认知，建议更新或重装 bridge。"
+  ],
+  "done.attention": [
+    "{name} 已停止，请确认当前结果。",
+    "{name} 本轮已暂停，正在等待你的检查。",
+    "{name} 已完成当前阶段，请查看并确认结果。"
+  ],
+  "done.success": [
+    "{name} 已完成本轮任务。",
+    "{name} 执行完成，可以查看结果了。",
+    "{name} 已顺利完成当前任务。"
+  ],
+  "failure.generic": [
+    "当前会话 {sessionName} 中，{name} 本轮执行失败，失败类型：{failureType}。",
+    "{name} 在当前会话 {sessionName} 中执行失败，错误码：{errorCode}，错误信息：{errorMessage}",
+    "当前会话 {sessionName} 中的 {name} 已重试 {retries} 次，重试耗尽状态：{retryExhausted}。"
+  ],
+  "failure.retry": [
+    "当前会话 {sessionName} 中，{name} 多次重试后仍未成功。",
+    "{name} 在当前会话 {sessionName} 中已重试 {retries} 次，错误码：{errorCode}。",
+    "当前会话 {sessionName} 中的 {name} 重试后仍然失败：{errorMessage}，失败类型：{failureType}。"
+  ],
+  "failure.tool": [
+    "当前会话 {sessionName} 中，{name} 的工具执行失败。",
+    "{name} 在当前会话 {sessionName} 中调用工具时出现错误：{errorMessage}",
+    "当前会话 {sessionName} 中的 {name} 工具执行异常，失败类型：{failureType}，错误码：{errorCode}。"
+  ],
+  "llm_error.api": [
+    "AI 服务暂时出现异常。",
+    "模型服务请求失败，请稍后再试。",
+    "AI 服务当前无法正常响应，请检查网络或服务状态。"
+  ],
+  "model_access.many": [
+    "当前会话 {sessionName} 的模型访问已连续失败 {count} 次，请稍后再试。",
+    "当前会话 {sessionName} 的连续模型访问失败次数为 {consecutiveRetryCount}，错误码：{errorCode}。",
+    "当前会话 {sessionName} 的第 {retry} 次模型访问仍未成功：{errorMessage}"
+  ],
+  "model_access.one": [
+    "当前会话 {sessionName} 的本次模型访问失败，请稍后再试。",
+    "当前会话 {sessionName} 的模型访问暂时未成功，错误码：{errorCode}。",
+    "当前会话 {sessionName} 的第 {retry} 次模型访问未成功：{errorMessage}"
+  ],
+  "question.empty": [
+    "当前会话 {sessionName} 中，{name} 正在等待你的选择。",
+    "{name} 在当前会话 {sessionName} 中有一项 {label} 需要你确认。",
+    "当前会话 {sessionName} 中的 {name} 正在等待你从选项中做出决定。"
+  ],
+  "question.many": [
+    "当前会话 {sessionName} 中，{name} 有 {count} 个问题等待回答。",
+    "{name} 在当前会话 {sessionName} 中有 {count} 个问题需要你确认。",
+    "当前会话 {sessionName} 中的 {name} 正在等待你处理这 {count} 个问题。"
+  ],
+  "question.one": [
+    "当前会话 {sessionName} 中，{name} 正在询问：{body}",
+    "{name} 在当前会话 {sessionName} 中有一个问题需要你决定：{body}",
+    "请回答当前会话 {sessionName} 中 {name} 的问题：{body}"
+  ],
+  "start": [
+    "{name} 已开始执行任务。",
+    "{name} 开始工作了，请稍等。",
+    "{name} 已进入本轮执行流程。"
+  ],
+  "thinking": [
+    "{name} 正在思考。",
+    "{name} 正在分析当前任务。",
+    "{name} 仍在处理中，请稍等。"
+  ]
+}

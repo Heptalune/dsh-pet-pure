@@ -1,0 +1,216 @@
+# -*- coding: utf-8 -*-
+"""Cursor visibility API adapter and automatic passthrough state tests."""
+from __future__ import annotations
+
+import os
+import sys
+from types import SimpleNamespace
+
+import pytest
+
+from pet import vision, window
+from pet.window import PetWindow
+
+
+def _ns_shim(real, **overrides):
+    """模块命名空间垫片：显式给出的成员覆盖，其余全部转发给真模块。
+
+    用法是 ``monkeypatch.setattr(<被测模块>, 'os'/'sys', _ns_shim(os, name='nt'))``
+    ——只换**被测模块里那个名字的绑定**。若写成 ``setattr('pet.window.os.name', …)``
+    或 ``setattr(vision.sys, 'platform', …)``，改的其实是**全局** os/sys 模块：
+    pathlib 的平台分派只看全局 ``os.name``，窗口期里 pytest 生成失败报告时会抛
+    ``NotImplementedError: cannot instantiate …Path`` ⇒ 整场 INTERNALERROR。
+    转发而不是只给被测的那一个成员，是因为同一窗口里被测模块的其它 os/sys
+    成员仍要能用。
+    """
+    class _Shim(SimpleNamespace):
+        def __getattr__(self, item):
+            return getattr(real, item)
+
+    return _Shim(**overrides)
+
+
+class FakeUser32:
+    def __init__(self, flags=0, result=1, error=None):
+        self.flags = flags
+        self.result = result
+        self.error = error
+        self.seen_size = None
+        self.GetCursorInfo = _FakeFunction(self._get_cursor_info)
+
+    def _get_cursor_info(self, pointer):
+        if self.error:
+            raise self.error
+        self.seen_size = pointer._obj.cbSize
+        pointer._obj.flags = self.flags
+        return self.result
+
+
+class _FakeFunction:
+    def __init__(self, function):
+        self.function = function
+        self.argtypes = None
+        self.restype = None
+
+    def __call__(self, *args):
+        return self.function(*args)
+
+
+@pytest.mark.parametrize(
+    ('flags', 'expected'),
+    [
+        (vision.CURSOR_SHOWING, 'SHOWING'),
+        (0, 'HIDDEN'),
+        (vision.CURSOR_SUPPRESSED, 'SUPPRESSED'),
+        (vision.CURSOR_SHOWING | vision.CURSOR_SUPPRESSED, 'SHOWING'),
+    ],
+)
+def test_get_cursor_visibility_maps_flags(monkeypatch, flags, expected):
+    monkeypatch.setattr(vision, 'sys', _ns_shim(sys, platform='win32'))
+    user32 = FakeUser32(flags=flags)
+
+    assert vision.get_cursor_visibility(user32) == expected
+    assert user32.seen_size == vision.ctypes.sizeof(vision._CursorInfo)
+
+
+@pytest.mark.parametrize('user32', [FakeUser32(result=0), FakeUser32(error=OSError())])
+def test_get_cursor_visibility_failures_are_unknown(monkeypatch, user32):
+    monkeypatch.setattr(vision, 'sys', _ns_shim(sys, platform='win32'))
+    assert vision.get_cursor_visibility(user32) == 'UNKNOWN'
+
+
+def test_get_cursor_visibility_non_windows_does_not_access_user32(monkeypatch):
+    monkeypatch.setattr(vision, 'sys', _ns_shim(sys, platform='linux'))
+    assert vision.get_cursor_visibility(SimpleNamespace()) == 'UNKNOWN'
+
+
+def _state_window(monkeypatch):
+    win = PetWindow.__new__(PetWindow)
+    win.cfg = {'cursor_hidden_passthrough': True}
+    win._cursor_hidden_passthrough = True
+    win._user_mouse_through = False
+    win._auto_cursor_hidden = False
+    win.mouse_through = False
+    win._cursor_visibility = 'UNKNOWN'
+    win._cursor_hidden_since = None
+    win._cursor_restore_pending = False
+    win._press_global = None
+    win._dragging = False
+    win._interaction_state = 'IDLE'
+    win._applied = []
+    monkeypatch.setattr(PetWindow, '_apply_effective_mouse_through',
+                        lambda self: self._applied.append(self._user_mouse_through or self._auto_cursor_hidden))
+    return win
+
+
+def test_cursor_hidden_requires_200ms_and_showing_restores(monkeypatch):
+    win = _state_window(monkeypatch)
+    times = iter((10.0, 10.1, 10.2, 10.21, 10.22))
+    monkeypatch.setattr('pet.window.time.monotonic', lambda: next(times))
+
+    win._on_cursor_visibility_changed('HIDDEN')
+    win._on_cursor_visibility_changed('HIDDEN')
+    win._on_cursor_visibility_changed('HIDDEN')
+    win._on_cursor_visibility_changed('HIDDEN')
+    assert win._auto_cursor_hidden is True
+    assert win._applied == [True]
+
+    win._on_cursor_visibility_changed('SHOWING')
+    assert win._auto_cursor_hidden is False
+    assert win._applied[-1] is False
+
+
+def test_unknown_is_conservative_and_manual_layer_survives(monkeypatch):
+    win = _state_window(monkeypatch)
+    win._user_mouse_through = True
+    win._auto_cursor_hidden = True
+    win._on_cursor_visibility_changed('UNKNOWN')
+    assert win._auto_cursor_hidden is True
+
+    win._on_cursor_visibility_changed('SHOWING')
+    assert win._auto_cursor_hidden is False
+    assert win._applied[-1] is True
+
+
+def test_cursor_transition_is_deferred_until_release(monkeypatch):
+    win = _state_window(monkeypatch)
+    win._press_global = object()
+    win._on_cursor_visibility_changed('SHOWING')
+    assert win._cursor_restore_pending is True
+    assert win._applied == []
+
+    win._press_global = None
+    win._dragging = False
+    win._interaction_state = 'IDLE'
+    win._auto_cursor_hidden = False
+    win._apply_effective_mouse_through()
+    assert win._applied == [False]
+
+
+def test_fs_watch_loop_survives_transient_runtime_error(monkeypatch):
+    """回归测试：全屏/光标监视线程遇到瞬时异常不应退出，应继续循环。"""
+    import threading
+    from pet import vision
+
+    win = PetWindow.__new__(PetWindow)
+    win._fs_stop = threading.Event()
+    win.cfg = {'cursor_hidden_passthrough': True, 'auto_hide_fullscreen': False}
+    win._cursor_hidden_passthrough = True
+    win.auto_hide_fullscreen = False
+    emitted = []
+    win.cursor_visibility_changed = SimpleNamespace(emit=lambda val: emitted.append(val))
+
+    calls = 0
+
+    def flaky_get_cursor_visibility():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("transient win32 error")
+        # 第二次成功
+        return "HIDDEN"
+
+    def fake_emit(val):
+        emitted.append(val)
+        win._fs_stop.set()
+
+    win.cursor_visibility_changed = SimpleNamespace(emit=fake_emit)
+    monkeypatch.setattr("pet.vision.get_cursor_visibility", flaky_get_cursor_visibility)
+    monkeypatch.setattr("shiboken6.isValid", lambda obj: True)
+
+    # 运行 watcher loop
+    win._fs_watch_loop()
+    assert calls >= 2
+    assert emitted == ["HIDDEN"]
+
+
+def test_apply_mouse_through_windows_uses_native_style(monkeypatch):
+    """回归：Windows 上切换穿透必须走原生 WS_EX_TRANSPARENT，不得 setWindowFlag
+    重建窗口（重建 = 原生句柄销毁重建 = 用户可见的频闪）。"""
+    win = PetWindow.__new__(PetWindow)
+    win._user_mouse_through = False
+    win._auto_cursor_hidden = False
+    win.mouse_through = False
+    native_calls = []
+    monkeypatch.setattr(window, 'os', _ns_shim(os, name='nt'))
+    monkeypatch.setattr('pet.window._set_windows_click_through',
+                        lambda hwnd, enabled: native_calls.append((hwnd, enabled)) or True)
+    monkeypatch.setattr(PetWindow, 'winId', lambda self: 43210)
+
+    def forbidden_flag_change(*args, **kwargs):
+        raise AssertionError('Windows 路径禁止 setWindowFlag 重建窗口')
+
+    monkeypatch.setattr(PetWindow, 'setWindowFlag', forbidden_flag_change)
+
+    win._apply_effective_mouse_through(True)
+    assert native_calls == [(43210, True)]
+    assert win.mouse_through is True
+
+    win._apply_effective_mouse_through(False)
+    assert native_calls == [(43210, True), (43210, False)]
+    assert win.mouse_through is False
+
+    # 同值短路：状态未变时不得再碰原生样式
+    win._apply_effective_mouse_through(False)
+    assert native_calls == [(43210, True), (43210, False)]
+

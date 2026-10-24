@@ -1,0 +1,233 @@
+# -*- coding: utf-8 -*-
+"""移动驱动的纯逻辑（无 Qt）：漫游目标、朝向判定、步幅量化与帧驱动位置。
+
+规则单一事实来源：朝向由「移动目标 + 屏幕位置」决定，与随机数无关——
+随机只用来挑方向（两侧都够得着时）和步长。RNG 一律可注入，便于钉死分支。
+位移按步态整圈量化（quantize_move），窗口位置由解码帧号推进
+（move_position_at_frame）——移动速度恒等于动画步态速度，不打滑。
+"""
+
+from __future__ import annotations
+
+# 模块级 import（禁止改成 from random import ...）：随机源经模块属性读取，
+# 单测按 `monkeypatch.setattr('pet.movement.random', ...)` /
+# `monkeypatch.setattr(pet.movement.random, ...)` 注入确定性实现
+# （见 tests/test_move_sync.py 的 _pin_rng）。改成 from-import 会让这些注入
+# 静默失效——测试仍绿但确定性丢失。
+import random
+
+__all__ = ["body_reach", "choose_move_direction", "curve_progress_at_time",
+           "inward_facing", "move_anim_tick", "move_position_at_frame",
+           "quantize_move", "wander_target_y"]
+
+
+def wander_target_y(
+    start_y: float,
+    top: float,
+    bottom: float,
+    height: float,
+    margin: float,
+    rnd=random,
+) -> int:
+    """Pick a bounded vertical wander target; injectable RNG keeps it testable."""
+    y_lo = top + margin
+    y_hi = bottom - height - margin
+    if y_hi <= y_lo:
+        return int(start_y)
+    max_dy = max(40, int((y_hi - y_lo) * 0.25))
+    return int(max(y_lo, min(y_hi, start_y + rnd.randint(-max_dy, max_dy))))
+
+
+def body_reach(
+    avail_left: float,
+    avail_right: float,
+    body_left: float,
+    body_width: float,
+    margin: float,
+) -> tuple[float, float, float]:
+    """身体框中心的可达界：返回 (cx, left_bound, right_bound)。
+
+    漫游空间按角色身体框算（虚拟窗口坐标）——身体不越出工作区，不用
+    "窗口中心 + _w/2"这类画布经验值。可达界含 margin 安全边距与身体半宽，
+    即身体框中心允许落到的端点；两侧剩余空间 = |cx - 对应 bound|。
+    """
+    half_w = body_width / 2
+    return (body_left + half_w,
+            avail_left + margin + half_w,
+            avail_right - margin - half_w)
+
+
+def choose_move_direction(
+    cx: float,
+    left_bound: float,
+    right_bound: float,
+    min_distance: float,
+    rnd=random,
+) -> int | None:
+    """按边缘可达性挑移动方向：-1 左 / +1 右 / None 两侧都走不了。
+
+    先算两侧剩余空间，够 min_distance 才算「可达」（含等号）。单侧可达 →
+    该侧（不掷骰）；两侧可达 → rnd.choice 二选一；都不可达 → None，调用方
+    据此拒绝建立移动计划（边缘可达性闸门，替代此前的「先取朝向再算出界」）。
+    """
+    if cx - left_bound >= min_distance and right_bound - cx >= min_distance:
+        return rnd.choice([-1, 1])
+    if cx - left_bound >= min_distance:
+        return -1
+    if right_bound - cx >= min_distance:
+        return 1
+    return None
+
+
+def inward_facing(
+    cx: float,
+    left_bound: float,
+    right_bound: float,
+    ratio: float = 0.07,
+) -> str | None:
+    """偏离中线超过滞回带时返回应朝的内侧方向，带内返回 None。
+
+    left_bound/right_bound 是 body_reach 算出的身体可达界（含 margin 与
+    身体半宽），不是屏幕可用区边缘。滞回带 = 可达界宽 × ratio，用于避免
+    角色在中线附近反复翻转朝向。
+    """
+    center = (left_bound + right_bound) / 2
+    band = (right_bound - left_bound) * ratio
+    if cx < center - band:
+        return "right"
+    if cx > center + band:
+        return "left"
+    return None
+
+
+def quantize_move(
+    distance_px: float,
+    stride_px: float,
+    room_px: float,
+    loop_duration: float,
+) -> tuple[int, float, float]:
+    """把目标位移量化为整圈步态：返回 (loops, distance, duration)。
+
+    位置帧驱动后窗口速度 = stride/loop_duration 恒等于动画步态速度（不打滑），
+    位移因此必须是步幅整倍数：n = max(1, round(distance/stride))。量化结果
+    越出可达空间（room）时递减圈数（下限 1 圈）；单圈仍越界（room < stride，
+    贴边场景）时位移夹到 room——此时速度略慢于步态，但身体绝不越界。
+    duration = n × loop_duration（loop_duration 已含 playback_speed 换算）。
+    """
+    stride = max(1.0, float(stride_px))
+    loops = max(1, round(distance_px / stride))
+    while loops > 1 and loops * stride > room_px:
+        loops -= 1
+    return loops, min(loops * stride, float(room_px)), loops * float(loop_duration)
+
+
+def move_position_at_frame(plan: dict, frames_elapsed: float) -> tuple[float, float]:
+    """按帧进度插值窗口位置，与墙钟/播放速度解耦。
+
+    无 curve：progress = frames_elapsed/total_frames 线性插值，夹到 [0,1]；
+    末拍（frames_elapsed ≥ total-1，帧号 0-based）强制 progress=1 提交终点。
+    有 curve（圈内逐帧位移曲线，curve[i] = 源帧 i 的圈内累计进度 0..1）：
+    progress = (已完成圈数 + curve[当前帧]) / 总圈数——动画静帧段曲线走平，
+    窗口原地停住；动帧段匀速推进。动帧才动、静帧不动，且位置只跟解码帧号
+    走（playback_speed 变化不失步）。
+    """
+    curve = plan.get('curve')
+    if curve:
+        per_loop = max(1, int(plan['frames_per_loop']))
+        loops = max(1, int(plan['loops']))
+        total = max(1, int(plan['total_frames']))
+        f = min(float(total), max(0.0, frames_elapsed))
+        loop_idx = min(int(f // per_loop), loops - 1)
+        intra = f - loop_idx * per_loop
+        # 曲线按下标对齐源帧号；长度不符时按比例折算（防御性，正常逐帧等长）
+        last = len(curve) - 1
+        pos = min(float(last), intra * last / max(1, per_loop - 1))
+        lo = int(pos)
+        frac = pos - lo
+        intra_progress = curve[lo] + (curve[min(lo + 1, last)] - curve[lo]) * frac
+        progress = (loop_idx + intra_progress) / loops
+    else:
+        total = max(1, int(plan['total_frames']))
+        # 帧号是 0-based：末拍 frames_elapsed == total-1，到位必须提交终点，
+        # 否则窗口停在离目标 ~stride/frames 处（无 curve 角色）。
+        if frames_elapsed >= total - 1:
+            progress = 1.0
+        else:
+            progress = min(1.0, max(0.0, frames_elapsed / total))
+    x = plan['start_x'] + (plan['target_x'] - plan['start_x']) * progress
+    y = plan['start_y'] + (plan['target_y'] - plan['start_y']) * progress
+    return x, y
+
+
+def curve_progress_at_time(
+    curve,
+    frames_per_loop: float,
+    loops: int,
+    elapsed: float,
+    loop_duration: float,
+) -> float:
+    """按墙钟时刻算「圈内逐帧位移曲线」的累计进度（0..1）。
+
+    曲线语义的唯一事实来源是 move_position_at_frame（curve[i] = 源帧 i 的
+    圈内累计进度）：本函数只把墙钟 elapsed 折算成等效帧号再委托它插值，
+    绝不另写一份曲线插值逻辑。
+
+    相位源取舍：旧架构以解码帧号为准（window.py:1773-1778 帧到达时按
+    frames_elapsed 定位位置），新架构行为层只有墙钟（tick 累加的 dt）。
+    两者的漂移上界是一个解码节流周期（帧队列背压/闲置降帧时最多滞后
+    一帧），折算到圈内位移是**亚像素级**；曲线本身仍严格决定「静帧段
+    不走、动帧段推进」，故共享/拖拽等视觉语义不受影响。
+
+    无曲线：返回线性进度（与无 curve 素材的匀速语义一致）。loop_duration
+    ≤ 0（meta 未就绪）返回 1.0：调用方本就以此值判定「不建立计划」。
+    """
+    total_loops = max(1, int(loops))
+    if not curve:
+        if loop_duration <= 0:
+            return 1.0
+        return max(0.0, min(1.0, float(elapsed) / (loop_duration * total_loops)))
+    if loop_duration <= 0:
+        return 1.0
+    per_loop = max(1, int(frames_per_loop))
+    frames_elapsed = max(0.0, float(elapsed)) / float(loop_duration) * per_loop
+    plan = {
+        'curve': curve,
+        'frames_per_loop': per_loop,
+        'loops': total_loops,
+        'total_frames': per_loop * total_loops,
+        'start_x': 0.0, 'start_y': 0.0,
+        'target_x': 1.0, 'target_y': 0.0,
+    }
+    return max(0.0, min(1.0, move_position_at_frame(plan, frames_elapsed)[0]))
+
+
+def move_anim_tick(host) -> None:
+    """走路帧间补点：两帧之间按墙钟把等效帧号推进到 ≤锚点+1 帧。
+
+    素材帧率（24-30fps）远低于显示节拍时，两帧之间位置长时间不动，是
+    中低速"抖动/帧数低"的主因（实机测量：走路位置更新 28.6Hz vs 170Hz
+    屏）。本函数在帧间按墙钟线性外推等效帧号（curve 素材经
+    move_position_at_frame 的小数帧插值，静帧段走平语义不变），封顶领先
+    锚点 1 帧——解码打滑/隐藏暂停时位置最多停在下一帧处等待，绝不超前
+    两帧以上；圈边界与末帧收口（末拍 progress=1 提交终点）仍由
+    _on_frame 帧驱动完成，帧到达时重锚定 anchor_frames/anchor_time，
+    帧号始终是位置权威。
+    """
+    from .window import time as _window_time  # 测试 seam：与 window 同读可补丁时钟
+
+    plan = host._move_plan
+    if (plan is None or 'total_frames' not in plan
+            or host._physics_mode is not None
+            or host._hidden_paused or host._closing):
+        return
+    duration = float(plan.get('duration') or 0.0)
+    total = float(plan.get('total_frames') or 0.0)
+    if duration <= 0.0 or total <= 0.0:
+        return
+    anchor_f = float(plan.get('anchor_frames', 0.0))
+    anchor_t = float(plan.get('anchor_time', 0.0))
+    fe = anchor_f + (_window_time.monotonic() - anchor_t) * total / duration
+    fe = min(fe, anchor_f + 1.0, total - 1.0)
+    if fe <= anchor_f + 1e-9:
+        return
+    host._move_window_towards(*move_position_at_frame(plan, fe))

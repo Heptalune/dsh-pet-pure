@@ -1,0 +1,602 @@
+# -*- coding: utf-8 -*-
+"""speech_bubble 纯函数区 — 气泡文本分页 / 定位 / 内容模型。
+
+批6-2 从 pet/speech_bubble.py 整体迁出（纯搬移，逻辑/默认值零改动）：
+- 文本规整与行数上限（normalize_bubble_text / bubble_max_lines）；
+- 省略与分页（elide_bubble_text / paginate_bubble_text，换行带避头尾禁则）；
+- 自适应列宽（bubble_column_for_text）与源头截断（truncate_bubble_text）；
+- 分页节奏与页码（page_dwell_ms / page_dwells_ms / page_dots 与 PAGE_* 常量）；
+- 定位与尺寸（bubble_rect_for_anchor / breath_bubble_size_for_anchor /
+  breath_bubble_size_for_scale）；
+- 自言自语图片清单（list_self_talk_images + SELF_TALK_IMAGE_SUFFIXES）。
+
+依赖方向：speech_bubble -> speech_bubble_text，本模块不得反向 import pet.speech_bubble。
+Qt 依赖面最小化：只导入纯函数实际使用的 Qt 类型。
+"""
+from __future__ import annotations
+
+import re
+from math import ceil
+from pathlib import Path
+
+from PySide6.QtCore import QPoint, QRect, QSize, Qt
+from PySide6.QtGui import QFontMetrics
+
+SELF_TALK_IMAGE_SUFFIXES = {
+    ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff",
+}
+
+# 气泡文本列的基础像素宽（短文案列宽，也是气泡整体宽度的由来），以及 label
+# 矩形相对最长行的余量。换行预算必须是 ``列宽 - 余量``：整型 horizontalAdvance
+# 累加与绘制时的自然（分数）宽度有亚像素差，余量同时吸收这个差，行尾才不会切字。
+BUBBLE_TEXT_COLUMN = 248
+BUBBLE_TEXT_SLACK = 4
+
+# 自适应列宽：短文案维持 248px（视觉与旧版一致），文案变长后逐步放宽到
+# 360px 上限。加宽换来每行装更多字——长文案的总行数、翻页次数与「末页孤行」
+# 概率一起下降；上限兼顾气泡观感与桌宠贴边时剩余的可用空间。
+BUBBLE_TEXT_COLUMN_MAX = 360
+BUBBLE_TEXT_COLUMN_GROWTH_CHARS = 60   # 超过这个字数才开始放宽
+BUBBLE_TEXT_COLUMN_GROWTH_SPAN = 100   # 再长 100 字到达列宽上限
+
+
+def bubble_wrap_width(column: int = BUBBLE_TEXT_COLUMN, slack: int = BUBBLE_TEXT_SLACK) -> int:
+    """Text wrapping budget: always leaves ``slack`` px inside the column."""
+    return max(1, int(column) - int(slack))
+
+
+# 「气泡文字大小」（配置键 bubble_text_scale，百分比/100）的缩放口径。
+# 缩放系数同时作用于**列宽**（进而作用于换行预算与 label 尺寸）与**字号**，
+# 气泡因此整体等比放大——只放大字号会让长行超出列宽被 label 右边界切掉，
+# 只放大气泡会让文字看起来更小（两者必须同一个系数）。
+BUBBLE_TEXT_SCALE_MIN = 0.5
+BUBBLE_TEXT_SCALE_MAX = 3.0
+# 各形态的基础字号（px），也是缩放前的原值：正文 13 / 副标题与页码 10 /
+# 标题态副标题 11。绘制侧按同一系数取整，度量侧从 label.font() 读回。
+BUBBLE_BODY_FONT_PX = 13
+BUBBLE_SUBTITLE_FONT_PX = 10
+BUBBLE_TITLE_FONT_PX = 11
+
+
+def clamp_bubble_text_scale(scale: float) -> float:
+    """把文字缩放系数钳进支持区间（非法值回退 1.0 = 与旧版逐像素一致）。"""
+    try:
+        value = float(scale)
+    except (TypeError, ValueError):
+        return 1.0
+    if value != value:  # NaN
+        return 1.0
+    return max(BUBBLE_TEXT_SCALE_MIN, min(BUBBLE_TEXT_SCALE_MAX, value))
+
+
+def scale_bubble_font_px(base_px: int, scale: float = 1.0) -> int:
+    """基础字号 × 缩放系数（取整、下限 1px）。scale=1.0 时原值返回。"""
+    return max(1, int(round(int(base_px) * clamp_bubble_text_scale(scale))))
+
+
+def bubble_column_for_text(text: str, scale: float = 1.0) -> int:
+    """按文案长度选择文本列宽：≤60 字保持 248px，之后逐步放宽、上限 360px。
+
+    只与「规整后的字数」有关（与换行度量无关），因此同一段文案在分页、量宽
+    与绘制三处拿到的是同一个列宽；空文案/短文案走原列宽，行为零变化。
+
+    ``scale`` 是「气泡文字大小」系数：列宽整体等比缩放（换行预算与 label
+    尺寸都跟着变，字号由绘制侧按同一系数取整），默认 1.0 时与旧版零差异。
+    """
+    factor = clamp_bubble_text_scale(scale)
+    base = BUBBLE_TEXT_COLUMN * factor
+    ceiling = BUBBLE_TEXT_COLUMN_MAX * factor
+    length = _budget_length(normalize_bubble_text(text))
+    if length <= BUBBLE_TEXT_COLUMN_GROWTH_CHARS:
+        return int(round(base))
+    grown = base + ceil(
+        (length - BUBBLE_TEXT_COLUMN_GROWTH_CHARS)
+        * (ceiling - base)
+        / BUBBLE_TEXT_COLUMN_GROWTH_SPAN
+    )
+    return int(min(ceiling, grown))
+
+
+def breath_bubble_size_for_anchor(anchor_rect: QRect, scale: float = 1.0) -> QSize:
+    """Scale the decorative water bubble with the pet's visible silhouette.
+
+    The original 240 x 195 reference canvas looks oversized beside the smaller
+    desktop-pet presets.  Keep its aspect ratio, but let the visible character
+    width choose a bounded 168..216 px canvas.  Using the alpha-mask bounds
+    (rather than the transparent video window) makes the result stable across
+    the 320/461/544/640 px pet presets.
+
+    ``scale`` 是内容缩放系数（文字气泡吃「气泡文字大小」、配图吃「配图大小」），
+    默认 1.0 时与旧版零差异。
+    """
+    visible_width = max(1, int(anchor_rect.width()))
+    width = max(168, min(216, int(round(visible_width * 0.82))))
+    factor = max(0.0, float(scale))
+    width = max(1, int(round(width * factor)))
+    return QSize(width, int(width * 195 / 240 + 0.5))
+
+
+def breath_bubble_size_for_scale(pet_scale: float, scale: float = 1.0) -> QSize:
+    """Return stable, strictly increasing sizes for the supported pet scales.
+
+    ``scale`` 语义同 :func:`breath_bubble_size_for_anchor`（内容缩放系数）。
+    """
+    pet = max(0.5, min(1.0, float(pet_scale)))
+    width = int(round(120 + 96 * pet))
+    factor = max(0.0, float(scale))
+    width = max(1, int(round(width * factor)))
+    return QSize(width, int(width * 195 / 240 + 0.5))
+
+
+def list_self_talk_images(directory: str | Path) -> list[Path]:
+    """List common image files directly inside a user-selected directory."""
+    # 空配置 = 未设置配图目录：``Path("")`` 解析成 CWD（是目录），会把进程
+    # 工作目录里的图片当成配图池扫描/加载（测试期 = 仓库根目录，便携包 =
+    # exe 旁边）——空串必须短路为空清单。
+    if not str(directory or "").strip():
+        return []
+    root = Path(str(directory)).expanduser()
+    if not root.is_dir():
+        return []
+    try:
+        return sorted(
+            path for path in root.iterdir()
+            if path.is_file() and path.suffix.lower() in SELF_TALK_IMAGE_SUFFIXES
+        )
+    except OSError:
+        return []
+
+
+def normalize_bubble_text(text: str, *, keep_breaks: bool = False) -> str:
+    """Convert model-flavoured Markdown into compact plain bubble text.
+
+    ``keep_breaks=True`` 时保留调用方自己写好的换行（只压掉行内多余空白），
+    用于"标题一行 + 内容一行"这类需要固定分行的文案；默认仍是把所有空白
+    （含换行）折叠成空格，即原有行为。
+    """
+    value = str(text or "").replace("```", " ")
+    value = re.sub(r"(?m)^\s{0,3}#{1,6}\s*", "", value)
+    value = re.sub(r"(?m)^\s*[-*+]\s+", "", value)
+    value = re.sub(r"[*_`]+", "", value)
+    if keep_breaks:
+        # 逐行压空白，但保留 \n —— 少了这一步，标题和内容会被折行拼到一起。
+        # U+2060 WORD JOINER 不是空白，折行时必须留下，否则金额短语的防拆标记会丢。
+        lines = [re.sub(r"[^\S\n]+", " ", line).strip() for line in value.split("\n")]
+        return "\n".join(line for line in lines if line)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+# 余额气泡用来把「余额/充值/赠送 + 金额」粘成一段的零宽标记。
+# 列宽、行数上限和阅读停留只数看得见的字，标记本身不占位。
+_WORD_JOINER = "\u2060"
+
+
+def _budget_length(text: str) -> int:
+    return len(str(text or "").replace(_WORD_JOINER, ""))
+
+
+def _measured_advance(metrics: QFontMetrics, text: str) -> int:
+    """字形宽度。WORD JOINER 按零宽计，不参与换行预算。"""
+    if _WORD_JOINER in text:
+        text = text.replace(_WORD_JOINER, "")
+    return metrics.horizontalAdvance(text)
+
+
+def bubble_max_lines(text: str, *, keep_breaks: bool = False) -> int:
+    """Return the max allowed lines for bubble text: 3 for short text, 6 for long."""
+    return (
+        3
+        if _budget_length(normalize_bubble_text(text, keep_breaks=keep_breaks)) <= 40
+        else 6
+    )
+
+
+# 避头尾（kinsoku）行首禁则字符：闭标点不允许出现在行首。逐字换行时若
+# 新行的首字符落在本集合内，就把上一行的末字符拉下来陪它——否则长句
+# 末尾的 "！" 会独占一行，分页时变成一个标点符号撑起一整页（孤字页）。
+# 开引号（" ' “ ‘）不在此列：它们出现在行首是合法的。
+LINE_START_FORBIDDEN = frozenset(
+    "，。、；：？！…·～）】》」』”’"
+    ",.;:!?)]}"
+)
+
+
+def _wrap_bubble_lines(
+    metrics: QFontMetrics, value: str, width: int, *, keep_breaks: bool = False
+) -> list[str]:
+    """Wrap ``value`` into lines within ``width`` px (kinsoku-aware).
+
+    没有 WORD JOINER 时仍是逐字换行。有连接符时，被粘住的一段在自己放得下的
+    时候整段挪到下一行；比行宽还长才按字形拆开。``keep_breaks=True`` 时
+    ``\\n`` 仍是强制换行。
+    """
+    if _WORD_JOINER not in value:
+        return _wrap_plain_bubble_lines(metrics, value, width, keep_breaks=keep_breaks)
+    return _wrap_joined_bubble_lines(metrics, value, width, keep_breaks=keep_breaks)
+
+
+def _wrap_plain_bubble_lines(
+    metrics: QFontMetrics, value: str, width: int, *, keep_breaks: bool = False
+) -> list[str]:
+    """逐字换行。行为与引入金额短语保护之前一致。"""
+    lines: list[str] = []
+    current = ""
+    for char in value:
+        if keep_breaks and char == "\n":
+            lines.append(current)
+            current = ""
+            continue
+        candidate = current + char
+        if current and metrics.horizontalAdvance(candidate) > width:
+            if char in LINE_START_FORBIDDEN and len(current) > 1:
+                # 行首禁则：上一行末字符下沉，与闭标点同行，避免标点孤字行。
+                lines.append(current[:-1])
+                current = current[-1] + char
+            else:
+                lines.append(current)
+                current = char
+        else:
+            current = candidate
+    if current:
+        lines.append(current)
+    if keep_breaks:
+        # 去掉强制换行产生的空行，但保留内容行的相对顺序。
+        lines = [line for line in lines if line.strip()]
+    return lines
+
+
+def _iter_wrap_tokens(value: str, *, keep_breaks: bool):
+    """把正文切成换行原子：强制换行，或由 WORD JOINER 粘住的一段，或单字。"""
+    index = 0
+    length = len(value)
+    while index < length:
+        if keep_breaks and value[index] == "\n":
+            yield "\n"
+            index += 1
+            continue
+        start = index
+        index += 1
+        while index < length and value[index] == _WORD_JOINER:
+            cursor = index + 1
+            while cursor < length and value[cursor] == _WORD_JOINER:
+                cursor += 1
+            if cursor < length and not (keep_breaks and value[cursor] == "\n"):
+                index = cursor + 1
+                continue
+            index = cursor
+            break
+        yield value[start:index]
+
+
+def _visible_pieces(token: str) -> list[str]:
+    """把一个连接段拆成「一个可见字 + 贴在它前面的连接符」。"""
+    pieces: list[str] = []
+    pending = ""
+    for char in token:
+        if char == _WORD_JOINER:
+            pending += char
+            continue
+        pieces.append(pending + char)
+        pending = ""
+    if pending:
+        if pieces:
+            pieces[-1] += pending
+        else:
+            pieces.append(pending)
+    return pieces or [token]
+
+
+def _trailing_joined_run(current: str) -> str:
+    if _WORD_JOINER not in current:
+        return ""
+    tail = ""
+    for token in _iter_wrap_tokens(current, keep_breaks=False):
+        tail = token
+    return tail if _WORD_JOINER in tail else ""
+
+
+def _is_line_start_forbidden(token: str) -> bool:
+    visible = token.replace(_WORD_JOINER, "")
+    return len(visible) == 1 and visible in LINE_START_FORBIDDEN
+
+
+def _place_token(lines: list[str], token: str, width: int, metrics: QFontMetrics) -> str:
+    """把 ``token`` 放到空行上。超长连接段按字形回退，至少落下一个字。"""
+    pieces = _visible_pieces(token)
+    if len(pieces) <= 1 or _measured_advance(metrics, token) <= width:
+        return token
+    current = ""
+    for piece in pieces:
+        if current and _measured_advance(metrics, current + piece) > width:
+            lines.append(current)
+            current = piece
+        else:
+            current += piece
+    return current
+
+
+def _break_before(
+    lines: list[str], current: str, token: str, width: int, metrics: QFontMetrics
+) -> str:
+    """``current`` 再加 ``token`` 就会超宽。返回下一行已经放进去的内容。"""
+    if _is_line_start_forbidden(token):
+        run = _trailing_joined_run(current)
+        if run and _measured_advance(metrics, run) <= width:
+            prefix = current[:-len(run)]
+            together = run + token
+            # 整段自己放得下时，禁则只能把整段拉下来，不能从段中间撕一个字。
+            if prefix and _measured_advance(metrics, together) <= width:
+                lines.append(prefix)
+                return together
+            lines.append(current)
+            return token
+        pieces = _visible_pieces(current)
+        if len(pieces) > 1 and _WORD_JOINER not in pieces[-1]:
+            tail = pieces[-1]
+            if _measured_advance(metrics, tail + token) <= width:
+                lines.append("".join(pieces[:-1]))
+                return tail + token
+    if current:
+        lines.append(current)
+    return _place_token(lines, token, width, metrics)
+
+
+def _wrap_joined_bubble_lines(
+    metrics: QFontMetrics, value: str, width: int, *, keep_breaks: bool = False
+) -> list[str]:
+    lines: list[str] = []
+    current = ""
+    for token in _iter_wrap_tokens(value, keep_breaks=keep_breaks):
+        if token == "\n":
+            lines.append(current)
+            current = ""
+            continue
+        if not current:
+            current = _place_token(lines, token, width, metrics)
+            continue
+        if _measured_advance(metrics, current + token) <= width:
+            current += token
+            continue
+        current = _break_before(lines, current, token, width, metrics)
+    if current:
+        lines.append(current)
+    if keep_breaks:
+        lines = [line for line in lines if line.strip()]
+    return lines
+
+
+def _elide_joined_tail(metrics: QFontMetrics, text: str, width: int) -> str:
+    """省略号落在连接段中间时，整段留下或整段去掉。
+
+    自己就比行宽还长的段仍交给 ``QFontMetrics.elidedText`` 按字形截断，
+    避免空行或把已经排出来的字丢掉。没有连接符的正文不走这里。
+    """
+    if _measured_advance(metrics, text) <= width:
+        return text
+    ellipsis = "…"
+    budget = width - metrics.horizontalAdvance(ellipsis)
+    if budget <= 0:
+        return metrics.elidedText(text, Qt.TextElideMode.ElideRight, width)
+    current = ""
+    for token in _iter_wrap_tokens(text, keep_breaks=False):
+        joined = _WORD_JOINER in token and _measured_advance(metrics, token) <= width
+        if joined:
+            if _measured_advance(metrics, current + token) <= budget:
+                current += token
+                continue
+            if not current and _measured_advance(metrics, token) <= width:
+                # 整段自己放得下、加上省略号才超宽：宁可段内截断也要保住
+                # 「这里还有内容」的信号——直接返回 token 会把后续正文无声
+                # 丢掉且没有省略号（PR #329 审查 F1）
+                return metrics.elidedText(text, Qt.TextElideMode.ElideRight, width)
+            break
+        if _measured_advance(metrics, current + token) > budget:
+            if not current:
+                return metrics.elidedText(text, Qt.TextElideMode.ElideRight, width)
+            break
+        current += token
+    if not current:
+        return metrics.elidedText(text, Qt.TextElideMode.ElideRight, width)
+    candidate = current + ellipsis
+    if _measured_advance(metrics, candidate) <= width:
+        return candidate
+    return metrics.elidedText(text, Qt.TextElideMode.ElideRight, width)
+
+
+def elide_bubble_text(
+    metrics: QFontMetrics,
+    text: str,
+    width: int,
+    max_lines: int = 3,
+    *,
+    keep_breaks: bool = False,
+) -> str:
+    """Wrap text into a bounded number of lines and elide the remainder."""
+    value = normalize_bubble_text(text, keep_breaks=keep_breaks)
+    if not value:
+        return ""
+    lines = _wrap_bubble_lines(metrics, value, width, keep_breaks=keep_breaks)
+    if len(lines) > max_lines:
+        remainder = "".join(lines[max_lines:])
+        lines = lines[:max_lines]
+        tail = lines[-1] + remainder
+        if _WORD_JOINER in tail:
+            lines[-1] = _elide_joined_tail(metrics, tail, width)
+        else:
+            lines[-1] = metrics.elidedText(
+                tail, Qt.TextElideMode.ElideRight, width
+            )
+    return "\n".join(lines)
+
+
+def truncate_bubble_text(text: str, limit: int, suffix: str = "…") -> str:
+    """源头截断：文案超过 ``limit`` 字时硬截断并追加 ``suffix``（纯函数）。
+
+    与 :func:`elide_bubble_text` 的区别：本函数在**进气泡之前**按字数动手，
+    不做换行/度量，因此可以给不同通路配不同上限与提示语（过程汇报「…」、
+    快速对话「…（全文见聊天窗）」）。``limit <= 0`` 视为不限长；未超长时
+    原样返回（含空串），便于调用方直接替换。
+    """
+    value = str(text or "")
+    if limit <= 0 or len(value) <= limit:
+        return value
+    return value[:limit] + suffix
+
+
+def bubble_label_size(
+    metrics: QFontMetrics,
+    pages: list[str],
+    column: int = BUBBLE_TEXT_COLUMN,
+    slack: int = BUBBLE_TEXT_SLACK,
+    min_width: int = 96,
+    min_height: int = 20,
+) -> QSize:
+    """Return the label rect that holds **every line that will be painted**.
+
+    必须用与换行相同的度量、并直接量真正的行宽，不能再用
+    ``QFontMetrics.boundingRect(..., TextWordWrap)`` 二次排版来推宽度：
+    那次排版按自然（分数）宽度断行，而 ``paginate_bubble_text`` 按整型
+    ``horizontalAdvance`` 累加，两者可以差一个字；label 一旦比真实行窄，
+    QLabel（wordWrap=False）就会把行尾那个字切在边界上，看起来像被气泡挡掉。
+
+    宽度按所有页里最长的一行 + ``slack`` 计算（页间切换不再改 label 尺寸）；
+    高度按行数 × ``lineSpacing`` 计算（所有页里行数最多的一页决定）。
+    """
+    lines = [line for page in pages for line in page.split("\n")] or [""]
+    widest = max(metrics.horizontalAdvance(line) for line in lines)
+    line_count = max((len(page.split("\n")) for page in pages), default=1)
+    return QSize(
+        max(min_width, min(column, widest + slack)),
+        max(min_height, line_count * metrics.lineSpacing() + 2),
+    )
+
+
+def paginate_bubble_text(
+    metrics: QFontMetrics,
+    text: str,
+    width: int,
+    max_lines: int = 3,
+    *,
+    keep_breaks: bool = False,
+) -> list[str]:
+    """Wrap text into pages of at most ``max_lines`` lines each — no elision.
+
+    Unlike :func:`elide_bubble_text`, no content is ever cut: long text is
+    split into several pages so the whole message can be shown by flipping
+    pages.  Returns a list of page strings (each already contains ``\n``
+    line breaks); a single-element list means one page suffices.  The tail
+    pages are rebalanced: when the last page would hold only one or two
+    lines, one line is borrowed from the page before it (3+2 -> 2+3) so the
+    tail never looks cut off.
+    """
+    value = normalize_bubble_text(text, keep_breaks=keep_breaks)
+    if not value:
+        return []
+    lines = _wrap_bubble_lines(metrics, value, width, keep_breaks=keep_breaks)
+    if len(lines) <= max_lines:
+        return ["\n".join(lines)]
+    pages = [
+        lines[start : start + max_lines]
+        for start in range(0, len(lines), max_lines)
+    ]
+    if len(pages) >= 2 and len(pages[-1]) <= 2 and len(pages[-2]) > 2:
+        # 孤行控制（收紧到 ≤2 行）：末页只剩 1~2 行时都重新平衡——从前一页
+        # 匀一行过来（3+1 → 2+2、3+2 → 2+3），避免末页零星几行看起来像气泡
+        # 被截断。借行后前一页仍有 ≥2 行、末页不超过 max_lines（max_lines≥3），
+        # 因此不需要让末页突破 max_lines 并页，气泡高度也不会变。
+        pages[-2], pages[-1] = pages[-2][:-1], [pages[-2][-1]] + pages[-1]
+    return ["\n".join(page) for page in pages]
+
+
+# —— 分页节奏与页码 ——
+# 每页停留时长按该页字数自适应：基础停留 + 每字阅读时长，钳制在
+# [PAGE_DWELL_MIN, PAGE_DWELL_MAX]。满页 3 行约 45-60 字 → 约 3.9-4.8s；
+# 稀疏短页（孤行重平衡后的两行短页）相应缩短，不再一刀切。
+PAGE_DWELL_BASE_MS = 1200
+PAGE_DWELL_PER_CHAR_MS = 60
+PAGE_DWELL_MIN_MS = 2500
+PAGE_DWELL_MAX_MS = 8000
+
+# 「回到第一页」停顿（只作用于多页气泡）：末页播完再压一拍，翻完一轮
+# 回到第一页/收起前不会显得被硬切。（曾加过首页 ×2 权重，主人评审后去掉：
+# 截断 + 自适应宽度落地后多页气泡本就罕见，首页双倍停留反而拖节奏。）
+PAGE_RETURN_PAUSE_MS = 800
+
+# 翻页过渡：淡出略快、淡入略慢，视觉更顺。
+PAGE_FADE_OUT_MS = 110
+PAGE_FADE_IN_MS = 150
+
+
+def page_dwell_ms(page_text: str) -> int:
+    """一页气泡文本的建议停留时长（按字数自适应）。"""
+    chars = _budget_length(str(page_text or "").replace("\n", ""))
+    dwell = PAGE_DWELL_BASE_MS + chars * PAGE_DWELL_PER_CHAR_MS
+    return max(PAGE_DWELL_MIN_MS, min(PAGE_DWELL_MAX_MS, dwell))
+
+
+def page_dwells_ms(pages: list[str]) -> list[int]:
+    """多页气泡的逐页停留表：末页额外压一拍「回首页」停顿。
+
+    表长与 ``pages`` 相同，末页那一格加上 ``PAGE_RETURN_PAUSE_MS``——末页
+    播完到下一轮/收起之间的停顿落在这一格里，翻页状态机不需要新增字段。
+    单页/空页时退化为 ``[page_dwell_ms(page)]``，与逐页自适应口径一致。
+    """
+    dwells = [page_dwell_ms(page) for page in pages]
+    if len(dwells) > 1:
+        dwells[-1] += PAGE_RETURN_PAUSE_MS
+    return dwells
+
+
+def page_dots(index: int, total: int) -> str:
+    """页码圆点：当前页实心 ●、其余空心 ○；单页返回空串。"""
+    if total <= 1:
+        return ""
+    index = max(0, min(int(index), total - 1))
+    return " ".join("●" if i == index else "○" for i in range(total))
+
+
+def bubble_rect_for_anchor(
+    anchor_rect: QRect,
+    bubble_size: QSize,
+    available: QRect,
+    placement: str = "top",
+    gap: int = 12,
+) -> QRect:
+    """Return an on-screen bubble rectangle that never covers the pet if space permits."""
+    width, height = bubble_size.width(), bubble_size.height()
+    centered_x = anchor_rect.center().x() - width // 2
+    left_x = anchor_rect.left() - width + max(24, anchor_rect.width() // 3)
+    right_x = anchor_rect.right() - max(24, anchor_rect.width() // 3)
+    above_y = anchor_rect.top() - height - gap
+    preferred = {
+        "top_left": QPoint(left_x, above_y),
+        "top_right": QPoint(right_x, above_y),
+        "top": QPoint(centered_x, above_y),
+    }.get(placement, QPoint(centered_x, above_y))
+    candidates = [
+        preferred,
+        QPoint(centered_x, above_y),
+        QPoint(left_x, above_y),
+        QPoint(right_x, above_y),
+        QPoint(anchor_rect.right() + gap, anchor_rect.center().y() - height // 2),
+        QPoint(anchor_rect.left() - width - gap, anchor_rect.center().y() - height // 2),
+        QPoint(centered_x, anchor_rect.bottom() + gap),
+    ]
+    for point in candidates:
+        candidate = QRect(point, bubble_size)
+        if available.contains(candidate) and not candidate.intersects(anchor_rect):
+            return candidate
+
+    # Clamp every fallback before scoring it. This keeps the bubble usable on a
+    # small display while preferring a result with zero overlap.
+    best = None
+    best_overlap = None
+    for point in candidates:
+        x = min(max(point.x(), available.left()), available.right() - width + 1)
+        y = min(max(point.y(), available.top()), available.bottom() - height + 1)
+        candidate = QRect(QPoint(x, y), bubble_size)
+        overlap = candidate.intersected(anchor_rect)
+        area = max(0, overlap.width()) * max(0, overlap.height())
+        if best is None or area < best_overlap:
+            best, best_overlap = candidate, area
+    return best or QRect(available.topLeft(), bubble_size)
